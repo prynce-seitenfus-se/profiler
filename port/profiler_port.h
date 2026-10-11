@@ -41,6 +41,18 @@ NO_INST uint32_t profiler_port_enter_critical(void);
  */
 NO_INST void profiler_port_exit_critical(uint32_t state);
 
+/**
+ * @brief Returns an opaque identifier of the current execution context.
+ *
+ * Used only in per-context mode (ProfilerConfig.contexts != NULL). RTOS
+ * integrations return the running task handle, or PROFILER_CONTEXT_ISR in
+ * handler mode. The weak default (profiler_port_context_default.c) returns NULL,
+ * which maps every event to a single context.
+ *
+ * @return Context identifier.
+ */
+NO_INST const void* profiler_port_context_id(void);
+
 /* -------------------------------------------------------------------------
  * Hardware Adapter Hooks for 16-bit and 2x16-bit Timer Ports
  * (Implemented by the application when using profiler_port_16bit_it or
@@ -71,6 +83,18 @@ NO_INST uint16_t profiler_port_hardware_timer16_read_high(void);
  * Called by profiler_port_init() in profiler_port_16bit_it and profiler_port_2x16bit.
  */
 NO_INST void profiler_port_hardware_timer16_init(void);
+
+/**
+ * @brief Application hook reporting a timer overflow not yet serviced by its ISR.
+ *
+ * Required by profiler_port_16bit_it. Return the hardware update/overflow flag
+ * (e.g. TIMx_SR.UIF) without clearing it. It lets profiler_port_ticks() stay
+ * monotonic when called with interrupts masked (context-switch hook in PendSV).
+ * The masked period must be shorter than half a timer period (32768 ticks).
+ *
+ * @return true if the counter wrapped and the overflow ISR is still pending.
+ */
+NO_INST bool profiler_port_hardware_timer16_overflow_pending(void);
 
 /**
  * @brief Interrupt service routine hook to notify profiler_port_16bit_it of a timer overflow.

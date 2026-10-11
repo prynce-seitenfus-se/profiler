@@ -12,12 +12,22 @@ NO_INST uint32_t profiler_port_ticks(void)
 {
     uint16_t high_before = s_timer_high_word;
     uint16_t low = profiler_port_hardware_timer16_read_low();
+    bool pending = profiler_port_hardware_timer16_overflow_pending();
     uint16_t high_after = s_timer_high_word;
 
-    /* If an overflow occurred while sampling the counter, re-read */
     if (high_before != high_after) {
+        /* The overflow ISR ran while sampling: re-read the counter */
         low = profiler_port_hardware_timer16_read_low();
         high_before = high_after;
+    } else if (pending && (low < 0x8000U)) {
+        /*
+         * The counter wrapped but the overflow ISR has not run yet (interrupts
+         * masked, e.g. inside PendSV): account for the pending overflow. A low
+         * value in the upper half was sampled before the wrap.
+         */
+        high_before++;
+    } else {
+        /* No overflow around the sample */
     }
 
     return ((uint32_t)high_before << 16U) | (uint32_t)low;

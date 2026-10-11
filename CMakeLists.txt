@@ -76,6 +76,7 @@ profiler_resolve_dependency(stream PROFILER_STREAM_DIR)
 
 set(PROFILER_LIB_SOURCES
     "${CMAKE_CURRENT_LIST_DIR}/profiler.c"
+    "${PROFILER_PORT_DIR}/profiler_port_context_default.c"
     "${PROFILER_HASHMAP_DIR}/hashmap.c"
     "${PROFILER_STREAM_DIR}/stream.c"
     "${PROFILER_TRANSPORT_SOURCE}"

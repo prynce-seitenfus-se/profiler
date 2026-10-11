@@ -10,8 +10,9 @@ The `profiler` module implements GCC's function instrumentation hooks (`__cyg_pr
 - **Zero Dynamic Allocation**: Freestanding operation over caller-allocated `HashMapEntry`, `ProfilerMetric`, and `ProfilerStackFrame` buffers (MISRA C:2012 Rule 21.3).
 - **In-Memory Cycle Accounting**: Tracks `call_count`, `total_cycles`, `min_cycles`, and `max_cycles` per unique function code address.
 - **Sub-Microsecond In-Place Accumulation**: Uses Knuth's multiplicative golden ratio hash and in-place reference lookup (`hashmap_get_ref`) to locate and update accumulators in single-digit CPU cycles.
-- **Single Shared Shadow Stack**: Measures exact elapsed function cycles across in-flight calls while safely dropping overflows when stack depth limits are reached.
-- **Packed Binary Protocol (`PROF-BIN v2`)**: Emits compact binary frames directly over `Stream`, sealed with an IEEE 802.3 CRC-32 trailer.
+- **Per-Context Shadow Stacks**: One shadow stack per execution context (RTOS task or ISR), so enter/exit events of preempted tasks never mis-pair. A single shared stack (legacy mode) is kept for bare-metal builds.
+- **Wall or Active Time**: Durations either include preemption/blocking (`PROFILER_TIME_WALL`) or count only the time the owning context was running (`PROFILER_TIME_ACTIVE`).
+- **Packed Binary Protocol (`PROF-BIN v3`)**: Emits compact binary frames directly over `Stream`, with pairing diagnostics in the header, sealed with an IEEE 802.3 CRC-32 trailer.
 - **Anti-Recursion Protection**: All module symbols decorated with `NO_INST` (`__attribute__((no_instrument_function))`).
 
 ---
@@ -90,6 +91,83 @@ profiler_stop();
 profiler_reset();
 ```
 
+Leaving `contexts` NULL (or `context_capacity` 0) selects **legacy mode**: one shared stack of
+`stack_depth` frames, exactly as in earlier releases. Use it only for bare-metal code without
+preemption.
+
+`profiler_start()` begins a new epoch: when hooks go from disabled to enabled, every shadow stack
+is emptied, so exits of calls entered before a stop or dump are counted as unmatched instead of
+being paired with stale frames. `profiler_dump()` does the same if the profiler was running.
+
+---
+
+## Execution Contexts and Time Modes
+
+With an RTOS, every task has its own call stack, so the profiler needs one shadow stack per
+context. Provide a context pool and a frame pool of `context_capacity * stack_depth` frames:
+
+```c
+#define CONTEXT_CAPACITY (6U)  /* pre-scheduler + tasks + idle + ISR */
+#define STACK_DEPTH      (16U) /* per context */
+
+static ProfilerStackFrame s_frames[CONTEXT_CAPACITY * STACK_DEPTH];
+static ProfilerContext    s_contexts[CONTEXT_CAPACITY];
+
+ProfilerConfig config = {
+    /* ... map and metrics as above ... */
+    .stack_frames     = s_frames,
+    .stack_depth      = STACK_DEPTH,
+    .contexts         = s_contexts,
+    .context_capacity = CONTEXT_CAPACITY,
+    .time_mode        = PROFILER_TIME_WALL /* or PROFILER_TIME_ACTIVE */
+};
+```
+
+The context of each hook comes from the port function `profiler_port_context_id()`. The library
+ships a weak default that returns NULL (one context). Slots are bound to IDs on first use; when all
+slots are in use, the event is dropped and `context_overflows` is incremented.
+
+| Mode | Duration of a call | Requires |
+|---|---|---|
+| `PROFILER_TIME_WALL` (default) | exit - enter, including preemption and blocking | `profiler_port_context_id()` |
+| `PROFILER_TIME_ACTIVE` | exit - enter minus the time the context was switched out, and minus instrumented ISR time that preempted it | context-switch notifications |
+
+### RTOS integration recipe
+
+1. Implement `profiler_port_context_id()` in a file compiled with `-fno-instrument-functions`.
+   Return `PROFILER_CONTEXT_ISR` in handler mode and the current task handle otherwise. Do not
+   call instrumented RTOS APIs from it; cache the current task in the switch hook instead.
+2. From the RTOS context-switch hook (interrupts masked), call
+   `profiler_context_switch(prev_task, next_task)`. It is a no-op in legacy mode or while stopped.
+3. When a task is deleted, call `profiler_context_release(task)` so its slot can be reused.
+
+```c
+static const void* volatile s_current_task = NULL;
+
+NO_INST const void* profiler_port_context_id(void)
+{
+    return (__get_IPSR() != 0U) ? PROFILER_CONTEXT_ISR : s_current_task;
+}
+
+NO_INST void app_switch_hook(SertosTaskHandle prev, SertosTaskHandle next)
+{
+    s_current_task = next;
+    profiler_context_switch(prev, next);
+}
+```
+
+See `sertos_stm32g070/app/profiler_context_sertos.c` for the SerTOS version.
+
+### Diagnostics
+
+| Counter | API | Meaning |
+|---|---|---|
+| `unmatched_exits` | `profiler_unmatched_exit_count()` | Exit with no matching frame in its context (for example, the call started before `profiler_start()`) |
+| `stale_frames` | `profiler_stale_frame_count()` | Frames above a matched exit that were discarded (missing exits, `longjmp`) |
+| `context_overflows` | `profiler_context_overflow_count()` | Events dropped because no context slot was free |
+
+All counters saturate at 0xFFFF and are cleared by `profiler_reset()`.
+
 ---
 
 ## Transport Integration
@@ -134,7 +212,7 @@ flush failure, and re-arm reception. Keep HAL callbacks limited to latching tran
 
 The module provides modular platform port backends selected via `PROFILER_PORT` in CMake:
 - `dwt`: Native ARM Cortex-M DWT `CYCCNT` (M3/M4/M7/M33/M55) with zero interrupt overhead.
-- `16bit_it`: Single 16-bit hardware timer extended with software overflow ISR (`profiler_port_16bit_it_overflow_isr`). Ideal for Cortex-M0/M0+, MSP430, AVR, and Renode simulation.
+- `16bit_it`: Single 16-bit hardware timer extended with software overflow ISR (`profiler_port_16bit_it_overflow_isr`). The application also implements `profiler_port_hardware_timer16_overflow_pending()` (e.g. return `TIMx_SR.UIF`) so timestamps taken with interrupts masked (context-switch hook in PendSV, critical sections) account for a wrap whose ISR has not run yet. Ideal for Cortex-M0/M0+, MSP430, AVR, and Renode simulation.
 - `2x16bit`: Cascaded Master/Slave 16-bit timers with rollover double-read glitch protection (e.g. STM32 TIM1+TIM3 hardware TRGO).
 - `win`: Native Windows host port using `QueryPerformanceCounter` and `CRITICAL_SECTION`.
 - `posix`: POSIX host port using `clock_gettime(CLOCK_MONOTONIC)` and `pthread_mutex`.
@@ -152,11 +230,32 @@ target_link_libraries(firmware PRIVATE profiler)
 
 ## Analyzing a Dump
 
-`parse_prof_dump.py` decodes the `PROF-BIN v2` binary format, verifies payload CRC-32 integrity, and resolves function addresses using `arm-none-eabi-addr2line`:
+`parse_prof_dump.py` decodes the `PROF-BIN v2` and `v3` binary formats, verifies payload CRC-32 integrity, and resolves function addresses using `arm-none-eabi-addr2line`:
 
 ```bash
 python parse_prof_dump.py dump.bin --elf firmware.elf --output report.csv --summary
 ```
+
+The CSV columns are the same for both versions. For v3 dumps the parser also prints the time mode
+and the diagnostic counters on stderr (and in `--summary`).
+
+### PROF-BIN v3 layout (little endian)
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | magic `PROF` |
+| 4 | 2 | version (`0x0003`) |
+| 6 | 2 | metric count |
+| 8 | 4 | timer frequency (Hz) |
+| 12 | 2 | dropped functions (map full) |
+| 14 | 2 | stack overflows |
+| 16 | 2 | unmatched exits |
+| 18 | 2 | stale frames |
+| 20 | 2 | context overflows |
+| 22 | 1 | time mode (0 wall, 1 active) |
+| 23 | 1 | reserved |
+| 24 | n * 24 | metrics (`ProfilerMetric`) |
+| end | 4 | CRC-32 of everything before it |
 
 For interactive visualization, see [Perfetto UI](https://ui.perfetto.dev/) for traces or
 [Speedscope](https://www.speedscope.app/) for profiles. The profiler's binary dump and the parser's

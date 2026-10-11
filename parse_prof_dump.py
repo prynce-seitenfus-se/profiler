@@ -10,8 +10,15 @@ from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Sequence, TextIO, Tuple
 
 
-HEADER_FORMAT = "<4sHHIHH"
-HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+HEADER_V2_FORMAT = "<4sHHIHH"
+HEADER_V2_SIZE = struct.calcsize(HEADER_V2_FORMAT)
+HEADER_V3_FORMAT = "<4sHHIHHHHHBB"
+HEADER_V3_SIZE = struct.calcsize(HEADER_V3_FORMAT)
+HEADER_V4_FORMAT = HEADER_V3_FORMAT + "HH"
+HEADER_V4_SIZE = struct.calcsize(HEADER_V4_FORMAT)
+HEADER_PREFIX_FORMAT = "<4sH"
+SUPPORTED_VERSIONS = {2: HEADER_V2_SIZE, 3: HEADER_V3_SIZE, 4: HEADER_V4_SIZE}
+TIME_MODES = {0: "wall", 1: "active"}
 RECORD_FORMAT = "<IIQII"
 RECORD_SIZE = struct.calcsize(RECORD_FORMAT)
 TRAILER_FORMAT = "<I"
@@ -39,6 +46,17 @@ class ProfilerHeader(NamedTuple):
     frequency: int
     dropped_functions: int
     stack_overflows: int
+    unmatched_exits: int = 0
+    stale_frames: int = 0
+    context_overflows: int = 0
+    time_mode: int = 0
+    header_size: int = HEADER_V2_SIZE
+    probe_overhead: int = 0
+    nested_overhead: int = 0
+
+    @property
+    def time_mode_name(self) -> str:
+        return TIME_MODES.get(self.time_mode, f"unknown({self.time_mode})")
 
 
 class MetricRecord(NamedTuple):
@@ -61,27 +79,71 @@ def calculate_crc32(seed: int, data: bytes) -> int:
     return crc
 
 
-def read_binary_dump(path: Path) -> Tuple[ProfilerHeader, List[MetricRecord], int]:
-    data = path.read_bytes()
-    if len(data) < HEADER_SIZE + TRAILER_SIZE:
+def parse_header(data: bytes) -> ProfilerHeader:
+    if len(data) < struct.calcsize(HEADER_PREFIX_FORMAT):
         raise ValueError("dump file is smaller than minimum binary packet size")
 
-    magic, version, count, frequency, dropped, stack_of = struct.unpack_from(
-        HEADER_FORMAT, data, 0
-    )
+    magic, version = struct.unpack_from(HEADER_PREFIX_FORMAT, data, 0)
     if magic != b"PROF":
         raise ValueError(f"invalid magic signature: {magic!r} (expected b'PROF')")
-    if version != 2:
+    if version not in SUPPORTED_VERSIONS:
         raise ValueError(f"unsupported PROF-BIN protocol version: {version}")
 
-    expected_len = HEADER_SIZE + (count * RECORD_SIZE) + TRAILER_SIZE
+    header_size = SUPPORTED_VERSIONS[version]
+    if len(data) < header_size + TRAILER_SIZE:
+        raise ValueError("dump file is smaller than minimum binary packet size")
+
+    if version == 2:
+        _, _, count, frequency, dropped, stack_of = struct.unpack_from(
+            HEADER_V2_FORMAT, data, 0
+        )
+        return ProfilerHeader(
+            magic=magic,
+            version=version,
+            record_count=count,
+            frequency=frequency,
+            dropped_functions=dropped,
+            stack_overflows=stack_of,
+            header_size=header_size,
+        )
+
+    probe, nested = 0, 0
+    if version == 3:
+        fields = struct.unpack_from(HEADER_V3_FORMAT, data, 0)
+    else:
+        fields = struct.unpack_from(HEADER_V4_FORMAT, data, 0)
+        probe, nested = fields[11], fields[12]
+    (_, _, count, frequency, dropped, stack_of, unmatched, stale, ctx_of, mode, _) = fields[:11]
+    return ProfilerHeader(
+        magic=magic,
+        version=version,
+        record_count=count,
+        frequency=frequency,
+        dropped_functions=dropped,
+        stack_overflows=stack_of,
+        unmatched_exits=unmatched,
+        stale_frames=stale,
+        context_overflows=ctx_of,
+        time_mode=mode,
+        header_size=header_size,
+        probe_overhead=probe,
+        nested_overhead=nested,
+    )
+
+
+def read_binary_dump(path: Path) -> Tuple[ProfilerHeader, List[MetricRecord], int]:
+    data = path.read_bytes()
+    header = parse_header(data)
+    count = header.record_count
+
+    expected_len = header.header_size + (count * RECORD_SIZE) + TRAILER_SIZE
     if len(data) < expected_len:
         raise ValueError(
             f"truncated binary dump: expected {expected_len} bytes, got {len(data)} bytes"
         )
 
     records: List[MetricRecord] = []
-    offset = HEADER_SIZE
+    offset = header.header_size
     for _ in range(count):
         fn_addr, calls, total_cyc, min_cyc, max_cyc = struct.unpack_from(
             RECORD_FORMAT, data, offset
@@ -106,16 +168,7 @@ def read_binary_dump(path: Path) -> Tuple[ProfilerHeader, List[MetricRecord], in
             f"CRC-32 checksum mismatch: calculated 0x{crc:08X}, expected 0x{trailer_crc:08X}"
         )
 
-    header = ProfilerHeader(
-        magic=magic,
-        version=version,
-        record_count=count,
-        frequency=frequency,
-        dropped_functions=dropped,
-        stack_overflows=stack_of,
-    )
     return header, records, trailer_crc
-
 
 def resolve_symbols(
     addresses: Sequence[int], elf_path: Optional[Path], addr2line: str
@@ -202,6 +255,15 @@ def write_summary(
     writer.writerow(("unique_functions", header.record_count))
     writer.writerow(("dropped_functions", header.dropped_functions))
     writer.writerow(("stack_overflows", header.stack_overflows))
+    writer.writerow(("protocol_version", header.version))
+    if header.version >= 3:
+        writer.writerow(("unmatched_exits", header.unmatched_exits))
+        writer.writerow(("stale_frames", header.stale_frames))
+        writer.writerow(("context_overflows", header.context_overflows))
+        writer.writerow(("time_mode", header.time_mode_name))
+    if header.version >= 4:
+        writer.writerow(("probe_overhead_cycles", header.probe_overhead))
+        writer.writerow(("nested_overhead_cycles", header.nested_overhead))
     writer.writerow(
         ("function", "calls", "total_cycles", "min_cycles", "avg_cycles", "max_cycles", "avg_us")
     )
@@ -256,6 +318,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         header, records, _ = read_binary_dump(args.dump_file)
+        if header.version >= 3:
+            print(
+                f"PROF-BIN v{header.version}: time_mode={header.time_mode_name} "
+                f"unmatched_exits={header.unmatched_exits} stale_frames={header.stale_frames} "
+                f"context_overflows={header.context_overflows} "
+                f"stack_overflows={header.stack_overflows} "
+                f"dropped_functions={header.dropped_functions}"
+                + (
+                    f" probe_overhead={header.probe_overhead} "
+                    f"nested_overhead={header.nested_overhead}"
+                    if header.version >= 4
+                    else ""
+                ),
+                file=sys.stderr,
+            )
         addresses = [record.fn_address for record in records]
         symbols = resolve_symbols(addresses, args.elf, args.addr2line)
 

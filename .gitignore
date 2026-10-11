@@ -53,3 +53,16 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# CMake generated files
+/build/
+/CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+Makefile
+build.ninja
+.ninja_deps
+.ninja_log
+CMakeUserPresets.json

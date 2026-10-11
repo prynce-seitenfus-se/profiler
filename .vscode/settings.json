@@ -1,0 +1,5 @@
+{
+    "cmake.cmakePath": "C:/ST/STM32CubeCLT_1.21.0/CMake/bin/cmake.exe",
+    "cmake.useCMakePresets": "always",
+    "cmake.configurePreset": "Debug"
+}
