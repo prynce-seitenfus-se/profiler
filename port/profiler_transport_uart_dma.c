@@ -1,6 +1,7 @@
 #include "profiler_transport.h"
 
 #include <limits.h>
+#include <stdbool.h>
 #include <string.h>
 
 #include "main.h"
@@ -15,6 +16,14 @@
 #error Unsupported STM32 family for profiler UART transport
 #endif
 
+#define DEFAULT_TX_CAPACITY (256U)
+#define DEFAULT_RX_CAPACITY (32U)
+#define DEFAULT_TIMEOUT_MS  (1000U)
+
+/* Internal DMA-safe static buffers */
+static uint8_t s_internal_tx_buf[DEFAULT_TX_CAPACITY] __attribute__((aligned(32)));
+static uint8_t s_internal_rx_buf[DEFAULT_RX_CAPACITY] __attribute__((aligned(32)));
+
 static ProfilerTransportConfig s_config;
 static Stream s_stream;
 static size_t s_tx_buffered = 0U;
@@ -25,6 +34,18 @@ static volatile ProfilerTransportStatus s_error = PROFILER_TRANSPORT_STATUS_OK;
 static volatile bool s_tx_complete = false;
 static volatile bool s_listening = false;
 static bool s_initialized = false;
+
+/* Default tick implementation using HAL */
+NO_INST static uint32_t default_tick_ms(void)
+{
+    return HAL_GetTick();
+}
+
+/* Default cooperative yield hook */
+NO_INST static void default_yield_ms(uint32_t milliseconds)
+{
+    HAL_Delay(milliseconds);
+}
 
 NO_INST static void transport_latch_error(ProfilerTransportStatus error)
 {
@@ -157,17 +178,39 @@ NO_INST static void transport_flush(void* context)
     }
 }
 
-NO_INST ProfilerTransportStatus profiler_transport_init(const ProfilerTransportConfig* config)
+NO_INST ProfilerTransportStatus profiler_transport_init_custom(const ProfilerTransportConfig* config)
 {
     uint32_t state;
 
-    if (!transport_buffers_valid(config) ||
-        !transport_timeout_valid(config) ||
-        !transport_device_valid(config)) {
+    if (config == NULL) {
         return PROFILER_TRANSPORT_STATUS_INVALID_PARAM;
     }
 
     s_config = *config;
+    if ((s_config.tx_buffer == NULL) || (s_config.tx_buffer_size == 0U)) {
+        s_config.tx_buffer = s_internal_tx_buf;
+        s_config.tx_buffer_size = sizeof(s_internal_tx_buf);
+    }
+    if ((s_config.rx_buffer == NULL) || (s_config.rx_buffer_size == 0U)) {
+        s_config.rx_buffer = s_internal_rx_buf;
+        s_config.rx_buffer_size = sizeof(s_internal_rx_buf);
+    }
+    if (s_config.tx_timeout_ms == 0U) {
+        s_config.tx_timeout_ms = DEFAULT_TIMEOUT_MS;
+    }
+    if (s_config.tick_ms == NULL) {
+        s_config.tick_ms = default_tick_ms;
+    }
+    if (s_config.yield == NULL) {
+        s_config.yield = default_yield_ms;
+    }
+
+    if (!transport_buffers_valid(&s_config) ||
+        !transport_timeout_valid(&s_config) ||
+        !transport_device_valid(&s_config)) {
+        return PROFILER_TRANSPORT_STATUS_INVALID_PARAM;
+    }
+
     s_stream = stream_init(&s_config, transport_write, transport_read, transport_flush);
     s_tx_buffered = 0U;
     s_rx_length = 0U;
@@ -181,7 +224,15 @@ NO_INST ProfilerTransportStatus profiler_transport_init(const ProfilerTransportC
     s_error = PROFILER_TRANSPORT_STATUS_OK;
     profiler_port_exit_critical(state);
 
-    return PROFILER_TRANSPORT_STATUS_OK;
+    return profiler_transport_listen();
+}
+
+NO_INST ProfilerTransportStatus profiler_transport_init(void* device)
+{
+    ProfilerTransportConfig cfg;
+    (void)memset(&cfg, 0, sizeof(cfg));
+    cfg.device = device;
+    return profiler_transport_init_custom(&cfg);
 }
 
 NO_INST const Stream* profiler_transport_stream(void)
@@ -256,6 +307,27 @@ NO_INST ProfilerTransportStatus profiler_transport_status(void)
 
     profiler_port_exit_critical(state);
     return error;
+}
+
+NO_INST bool profiler_transport_process(void)
+{
+    size_t frame_length = 0U;
+    uint8_t events;
+    bool handled;
+
+    if (!s_initialized) {
+        return false;
+    }
+
+    events = profiler_transport_poll(&frame_length);
+    if ((events & PROFILER_TRANSPORT_EVENT_FRAME) == 0U) {
+        return false;
+    }
+
+    handled = profiler_stream_process(&s_stream);
+
+    (void)profiler_transport_listen();
+    return handled;
 }
 
 NO_INST void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef* uart, uint16_t size)

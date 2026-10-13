@@ -10,7 +10,7 @@
 
 /**
  * @file profiler_transport.h
- * @brief Hardware-independent transport contract for profiler I/O.
+ * @brief Hardware-independent deep transport contract and autonomous service for profiler I/O.
  */
 
 #ifdef __cplusplus
@@ -34,43 +34,68 @@ typedef enum {
 #define PROFILER_TRANSPORT_EVENT_ERROR   (0x04U)
 
 /**
- * @brief Monotonic millisecond clock supplied by the application.
+ * @brief Monotonic millisecond clock hook.
  *
  * @return Current free-running millisecond counter value.
  */
 typedef uint32_t (*ProfilerTransportTickFn)(void);
 
 /**
- * @brief Cooperative wait hook supplied by the application.
+ * @brief Cooperative wait hook.
  *
  * @param milliseconds Requested wait duration.
  */
 typedef void (*ProfilerTransportYieldFn)(uint32_t milliseconds);
 
 /**
- * @brief Caller-owned, statically allocated transport configuration.
+ * @brief Advanced transport configuration (optional).
+ *
+ * For custom buffer overrides or timing hooks. If buffers are NULL or 0,
+ * backend internal static buffers (256B TX, 32B RX) are used automatically.
  */
 typedef struct {
     void* device;                        /**< Backend handle, such as a UART handle. */
-    uint8_t* tx_buffer;                  /**< Caller-owned transmit buffer. */
-    size_t tx_buffer_size;               /**< Transmit buffer capacity in bytes. */
-    uint8_t* rx_buffer;                  /**< Caller-owned receive frame buffer. */
-    size_t rx_buffer_size;               /**< Receive buffer capacity in bytes. */
-    uint32_t tx_timeout_ms;              /**< Per-chunk timeout; zero disables it where supported. */
-    ProfilerTransportTickFn tick_ms;     /**< Monotonic millisecond clock, required for timeouts. */
-    ProfilerTransportYieldFn yield;      /**< Cooperative wait hook; NULL permits busy-waiting. */
+    uint8_t* tx_buffer;                  /**< Optional custom transmit buffer (NULL for internal). */
+    size_t tx_buffer_size;               /**< Transmit buffer capacity in bytes (0 for internal 256). */
+    uint8_t* rx_buffer;                  /**< Optional custom receive frame buffer (NULL for internal). */
+    size_t rx_buffer_size;               /**< Receive buffer capacity in bytes (0 for internal 32). */
+    uint32_t tx_timeout_ms;              /**< Per-chunk timeout (0 defaults to 1000ms). */
+    ProfilerTransportTickFn tick_ms;     /**< Monotonic clock (NULL uses target HAL/port clock). */
+    ProfilerTransportYieldFn yield;      /**< Cooperative wait hook (NULL permits busy/delay wait). */
 } ProfilerTransportConfig;
 
 /**
- * @brief Initializes the selected backend and binds its Stream callbacks.
+ * @brief Initializes the transport with hardware device handle and internal default buffers.
  *
- * @param[in] config Caller-owned configuration with static buffer storage.
+ * Automatically uses internal 256B TX, 32B RX DMA-aligned buffers and target tick/yield hooks.
+ * Automatically arms reception (`profiler_transport_listen`).
+ *
+ * @param device Target hardware handle (e.g. &huart2, or NULL for memory/null backend).
  * @return `PROFILER_TRANSPORT_STATUS_OK` on success, otherwise an error.
  */
-NO_INST ProfilerTransportStatus profiler_transport_init(const ProfilerTransportConfig* config);
+NO_INST ProfilerTransportStatus profiler_transport_init(void* device);
 
 /**
- * @brief Returns the initialized bidirectional Stream.
+ * @brief Initializes the transport with custom configuration overrides.
+ *
+ * @param[in] config Advanced configuration.
+ * @return `PROFILER_TRANSPORT_STATUS_OK` on success, otherwise an error.
+ */
+NO_INST ProfilerTransportStatus profiler_transport_init_custom(const ProfilerTransportConfig* config);
+
+/**
+ * @brief Autonomous command processing service loop.
+ *
+ * Polls the transport, delegates to profiler_stream_process() for prof-<opt> commands,
+ * streams formatted responses directly, and automatically re-arms reception.
+ * Returns true if a profiler command was handled during this call.
+ *
+ * @return true if a profiler command was processed, false otherwise.
+ */
+NO_INST bool profiler_transport_process(void);
+
+/**
+ * @brief Returns the initialized bidirectional Stream conduit.
  *
  * @return Stream pointer, or NULL when the backend is not initialized.
  */
@@ -95,9 +120,6 @@ NO_INST uint8_t profiler_transport_poll(size_t* out_length);
 
 /**
  * @brief Reads and clears the sticky transport error.
- *
- * Use this to observe failures from Stream write/flush callbacks; StreamFlushFn cannot return
- * a status.
  *
  * @return `PROFILER_TRANSPORT_STATUS_OK` when no error was latched.
  */

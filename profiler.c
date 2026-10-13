@@ -48,6 +48,7 @@ typedef struct ProfilerBinHeader {
 /* Shadow call stack frame */
 typedef struct ProfilerStackFrame {
     const void* fn_address;
+    const char* name;
     uint32_t    enter_timestamp;
     uint32_t    enter_suspended;
     uint32_t    enter_probe;
@@ -410,12 +411,12 @@ NO_INST static uint32_t frame_cycles(const ProfilerContext* ctx, const ProfilerS
     return cycles;
 }
 
-NO_INST static void record_call(const ProfilerContext* ctx, const void* fn, uint32_t cycles, uint32_t overhead)
+NO_INST static void record_call(const ProfilerContext* ctx, const void* fn, const char* name, uint32_t cycles, uint32_t overhead)
 {
     uint32_t net = (overhead < cycles) ? (cycles - overhead) : 0U;
 
     if (ctx != &s_calibration_context) {
-        update_metric(fn, NULL, net);
+        update_metric(fn, name, net);
     } else if ((fn == (const void*)&s_calibration_ids[0]) && (net < s_calibration_min)) {
         s_calibration_min = net;
     }
@@ -430,8 +431,9 @@ NO_INST static void pop_context_frame(ProfilerContext* ctx, const void* fn, uint
     }
 
     size_t match_idx = match_pos - 1U;
+    const char* name = ctx->frames[match_idx].name;
     uint32_t cycles = frame_cycles(ctx, &ctx->frames[match_idx], ts);
-    record_call(ctx, fn, cycles, overhead);
+    record_call(ctx, fn, name, cycles, overhead);
 
     size_t discarded = ctx->index - match_pos;
     if (discarded > 0U) {
@@ -464,6 +466,7 @@ NO_INST __attribute__((noinline)) void profiler_scope_enter(const void* id, cons
         if (ctx->index < depth) {
             frame = &ctx->frames[ctx->index];
             frame->fn_address = id;
+            frame->name = name;
             frame->enter_suspended = ctx->suspended_cycles;
             ctx->index++;
         } else {
@@ -475,17 +478,6 @@ NO_INST __attribute__((noinline)) void profiler_scope_enter(const void* id, cons
         if (frame != NULL) {
             frame->enter_probe = ctx->probe_cycles;
             frame->enter_timestamp = ts;
-        }
-
-        /* Associate name upon entry if already known */
-        if (name != NULL) {
-            void** slot = hashmap_get_ref(&s_map, id);
-            if (slot != NULL) {
-                ProfilerInternalMetric* m = (ProfilerInternalMetric*)(*slot);
-                if (m->name == NULL) {
-                    m->name = name;
-                }
-            }
         }
     }
 
@@ -650,4 +642,126 @@ NO_INST bool profiler_dump(const struct Stream* stream, ProfilerDumpFormat forma
     profiler_port_exit_critical(state);
 
     return success;
+}
+
+NO_INST bool profiler_cmd_execute(const char* cmd, const struct Stream* stream)
+{
+    size_t first = 0U;
+    size_t last;
+    size_t len;
+    const char* opt;
+    size_t opt_len;
+
+    if ((cmd == NULL) || (stream == NULL)) {
+        return false;
+    }
+
+    last = strlen(cmd);
+
+    /* Strip leading and trailing whitespace */
+    while ((first < last) &&
+           ((cmd[first] == ' ') || (cmd[first] == '\t') ||
+            (cmd[first] == '\r') || (cmd[first] == '\n'))) {
+        first++;
+    }
+    while ((last > first) &&
+           ((cmd[last - 1U] == ' ') || (cmd[last - 1U] == '\t') ||
+            (cmd[last - 1U] == '\r') || (cmd[last - 1U] == '\n'))) {
+        last--;
+    }
+
+    len = last - first;
+
+    /* Profiler commands MUST start with "prof-" */
+    if ((len < 5U) || (strncmp(&cmd[first], "prof-", 5U) != 0)) {
+        return false;
+    }
+
+    opt = &cmd[first + 5U];
+    opt_len = len - 5U;
+
+    if ((opt_len == 4U) && (strncmp(opt, "dump", 4U) == 0)) {
+        profiler_stop();
+        (void)profiler_dump(stream, PROFILER_DUMP_BIN);
+        profiler_start();
+        return true;
+    } else if ((opt_len == 3U) && (strncmp(opt, "top", 3U) == 0)) {
+        profiler_stop();
+        (void)profiler_dump(stream, PROFILER_DUMP_TOP);
+        profiler_start();
+        return true;
+    } else if ((opt_len == 5U) && (strncmp(opt, "reset", 5U) == 0)) {
+        profiler_reset();
+        static const char reset_msg[] = "OK: profiler reset\r\n";
+        (void)stream_write(stream, (const uint8_t*)reset_msg, sizeof(reset_msg) - 1U);
+        stream_flush(stream);
+        return true;
+    } else if ((opt_len == 6U) && (strncmp(opt, "status", 6U) == 0)) {
+        char status_buf[128];
+        int s_len = snprintf(status_buf, sizeof(status_buf),
+            "\r\nProfiler Status:\r\n  Enabled:   %s\r\n  Frequency: %lu Hz\r\n\r\n",
+            profiler_enabled() ? "YES" : "NO",
+            (unsigned long)profiler_frequency());
+        if (s_len > 0) {
+            (void)stream_write(stream, (const uint8_t*)status_buf, (size_t)s_len);
+            stream_flush(stream);
+        }
+        return true;
+    } else if ((opt_len == 4U) && (strncmp(opt, "help", 4U) == 0)) {
+        static const char help_msg[] =
+            "\r\nProfiler Commands:\r\n"
+            "  prof-top    - Dump ASCII cycle statistics table\r\n"
+            "  prof-dump   - Stream binary telemetry (PROF-BIN)\r\n"
+            "  prof-reset  - Reset accumulated cycle statistics\r\n"
+            "  prof-status - Show profiler status and clock frequency\r\n"
+            "  prof-help   - Print this command list\r\n\r\n";
+        (void)stream_write(stream, (const uint8_t*)help_msg, sizeof(help_msg) - 1U);
+        stream_flush(stream);
+        return true;
+    } else {
+        static const char err_msg[] = "ERR: unknown profiler command (type 'prof-help')\r\n";
+        (void)stream_write(stream, (const uint8_t*)err_msg, sizeof(err_msg) - 1U);
+        stream_flush(stream);
+        return true;
+    }
+}
+
+NO_INST bool profiler_stream_process(const struct Stream* stream)
+{
+    char line_buffer[64];
+    size_t line_len = 0U;
+    uint8_t ch;
+    bool handled = false;
+
+    if (stream == NULL) {
+        return false;
+    }
+
+    while (stream_read(stream, &ch, 1U) == 1U) {
+        if ((ch == (uint8_t)'\r') || (ch == (uint8_t)'\n')) {
+            if (line_len > 0U) {
+                line_buffer[line_len] = '\0';
+                if (profiler_cmd_execute(line_buffer, stream)) {
+                    handled = true;
+                }
+                line_len = 0U;
+            }
+        } else {
+            if (line_len < (sizeof(line_buffer) - 1U)) {
+                line_buffer[line_len++] = (char)ch;
+            } else {
+                /* Discard oversized frame */
+                line_len = 0U;
+            }
+        }
+    }
+
+    if (line_len > 0U) {
+        line_buffer[line_len] = '\0';
+        if (profiler_cmd_execute(line_buffer, stream)) {
+            handled = true;
+        }
+    }
+
+    return handled;
 }

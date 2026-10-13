@@ -4,6 +4,13 @@
 
 #include "profiler_port.h"
 
+#define DEFAULT_TX_CAPACITY (1024U)
+#define DEFAULT_RX_CAPACITY (128U)
+
+/* Internal static memory buffers */
+static uint8_t s_internal_tx_buf[DEFAULT_TX_CAPACITY];
+static uint8_t s_internal_rx_buf[DEFAULT_RX_CAPACITY];
+
 static ProfilerTransportConfig s_config;
 static Stream s_stream;
 static size_t s_tx_length = 0U;
@@ -76,18 +83,30 @@ NO_INST static void transport_flush(void* context)
     (void)context;
 }
 
-NO_INST ProfilerTransportStatus profiler_transport_init(const ProfilerTransportConfig* config)
+NO_INST ProfilerTransportStatus profiler_transport_init_custom(const ProfilerTransportConfig* config)
 {
     uint32_t state;
 
-    if ((config == NULL) ||
-        (config->tx_buffer == NULL) || (config->tx_buffer_size == 0U) ||
-        (config->rx_buffer == NULL) || (config->rx_buffer_size == 0U) ||
-        ((config->tx_timeout_ms != 0U) && (config->tick_ms == NULL))) {
+    if (config == NULL) {
         return PROFILER_TRANSPORT_STATUS_INVALID_PARAM;
     }
 
     s_config = *config;
+    if ((s_config.tx_buffer == NULL) || (s_config.tx_buffer_size == 0U)) {
+        s_config.tx_buffer = s_internal_tx_buf;
+        s_config.tx_buffer_size = sizeof(s_internal_tx_buf);
+    }
+    if ((s_config.rx_buffer == NULL) || (s_config.rx_buffer_size == 0U)) {
+        s_config.rx_buffer = s_internal_rx_buf;
+        s_config.rx_buffer_size = sizeof(s_internal_rx_buf);
+    }
+
+    if ((s_config.tx_buffer == NULL) || (s_config.tx_buffer_size == 0U) ||
+        (s_config.rx_buffer == NULL) || (s_config.rx_buffer_size == 0U) ||
+        ((s_config.tx_timeout_ms != 0U) && (s_config.tick_ms == NULL))) {
+        return PROFILER_TRANSPORT_STATUS_INVALID_PARAM;
+    }
+
     s_stream = stream_init(&s_config, transport_write, transport_read, transport_flush);
     s_tx_length = 0U;
     s_rx_length = 0U;
@@ -100,7 +119,15 @@ NO_INST ProfilerTransportStatus profiler_transport_init(const ProfilerTransportC
     s_error = PROFILER_TRANSPORT_STATUS_OK;
     profiler_port_exit_critical(state);
 
-    return PROFILER_TRANSPORT_STATUS_OK;
+    return profiler_transport_listen();
+}
+
+NO_INST ProfilerTransportStatus profiler_transport_init(void* device)
+{
+    ProfilerTransportConfig cfg;
+    (void)memset(&cfg, 0, sizeof(cfg));
+    cfg.device = device;
+    return profiler_transport_init_custom(&cfg);
 }
 
 NO_INST const Stream* profiler_transport_stream(void)
@@ -159,6 +186,27 @@ NO_INST ProfilerTransportStatus profiler_transport_status(void)
 
     profiler_port_exit_critical(state);
     return error;
+}
+
+NO_INST bool profiler_transport_process(void)
+{
+    size_t frame_length = 0U;
+    uint8_t events;
+    bool handled;
+
+    if (!s_initialized) {
+        return false;
+    }
+
+    events = profiler_transport_poll(&frame_length);
+    if ((events & PROFILER_TRANSPORT_EVENT_FRAME) == 0U) {
+        return false;
+    }
+
+    handled = profiler_stream_process(&s_stream);
+
+    (void)profiler_transport_listen();
+    return handled;
 }
 
 bool profiler_transport_memory_inject_rx(const uint8_t* data, size_t length)

@@ -30,14 +30,45 @@ struct Stream;
  * Transparently captures the function name symbol without exposing separate macros.
  */
 #ifdef PROFILER_SCOPES_ENABLED
+NO_INST void profiler_scope_enter(const void* id, const char* name);
+NO_INST void profiler_scope_exit(const void* id);
+
 #define PROFILER_SCOPE(fn, call)                          \
     do {                                                  \
         profiler_scope_enter(PROFILER_FN_ID(fn), #fn);    \
         call;                                             \
         profiler_scope_exit(PROFILER_FN_ID(fn));          \
     } while (0)
+
+NO_INST static inline void _profiler_function_cleanup(const void* const* token)
+{
+    if ((token != NULL) && (*token != NULL)) {
+        profiler_scope_exit(*token);
+    }
+}
+
+/**
+ * @brief Automatically measures the current function with zero boilerplate.
+ *
+ * Places a single-line probe at the beginning of the function body.
+ * Automatically captures __func__ as function name and unique scope ID.
+ * Automatically invokes profiler_scope_exit() upon return via GCC/Clang cleanup attribute.
+ */
+#define PROFILER_FUNCTION() \
+    const void* _prof_scope_token __attribute__((cleanup(_profiler_function_cleanup), unused)) = (const void*)__func__; \
+    profiler_scope_enter(_prof_scope_token, __func__)
+
+/**
+ * @brief Measures the current function using an explicit custom name string literal.
+ */
+#define PROFILER_FUNCTION_NAMED(name) \
+    const void* _prof_scope_token __attribute__((cleanup(_profiler_function_cleanup), unused)) = (const void*)(name); \
+    profiler_scope_enter(_prof_scope_token, name)
+
 #else
 #define PROFILER_SCOPE(fn, call) do { call; } while (0)
+#define PROFILER_FUNCTION() do {} while (0)
+#define PROFILER_FUNCTION_NAMED(name) do {} while (0)
 #endif
 
 /**
@@ -131,6 +162,35 @@ NO_INST void profiler_context_switch(const void* prev_id, const void* next_id);
  * @param[in] id Context identifier to release.
  */
 NO_INST void profiler_context_release(const void* id);
+
+/**
+ * @brief Executes a profiler command string if it begins with "prof-".
+ *
+ * Supported commands:
+ *   - prof-dump   : Dumps binary profiler telemetry (PROF-BIN)
+ *   - prof-top    : Dumps formatted ASCII execution table
+ *   - prof-reset  : Resets accumulated statistics
+ *   - prof-status : Prints profiler runtime status and clock frequency
+ *   - prof-help   : Prints supported profiler commands
+ *
+ * Non-"prof-" commands are rejected and return false.
+ *
+ * @param[in] cmd    Null-terminated command string. Must begin with "prof-".
+ * @param[in] stream Output stream conduit for telemetry/response.
+ * @return true if command started with "prof-" and was executed, false otherwise.
+ */
+NO_INST bool profiler_cmd_execute(const char* cmd, const struct Stream* stream);
+
+/**
+ * @brief Processes incoming profiler commands over an arbitrary Stream.
+ *
+ * Reads incoming bytes from the stream, parses lines, and passes any command
+ * beginning with "prof-" to profiler_cmd_execute(). Non-profiler commands are ignored.
+ *
+ * @param[in] stream Bidirectional stream conduit.
+ * @return true if a profiler command was processed, false otherwise.
+ */
+NO_INST bool profiler_stream_process(const struct Stream* stream);
 
 #ifdef __cplusplus
 }
