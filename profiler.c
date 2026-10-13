@@ -1,9 +1,22 @@
 #include "profiler.h"
 #include "profiler_port.h"
+#include "profiler_transport.h"
 #include "stream.h"
 #include "hashmap.h"
 #include <string.h>
 #include <stdio.h>
+
+/* Weak fallback for builds without a transport backend */
+__attribute__((weak)) NO_INST ProfilerTransportStatus profiler_transport_init(void* device)
+{
+    (void)device;
+    return PROFILER_TRANSPORT_STATUS_OK;
+}
+
+__attribute__((weak)) NO_INST bool profiler_transport_process(void)
+{
+    return false;
+}
 
 #define PROFILER_CAPACITY_FUNCTIONS (128U)
 #define PROFILER_CAPACITY_STACK     (16U)
@@ -83,6 +96,8 @@ static uint16_t               s_stack_overflows = 0U;
 static uint16_t               s_unmatched_exits = 0U;
 static uint16_t               s_stale_frames = 0U;
 static uint16_t               s_context_overflows = 0U;
+static uint32_t               s_last_wall_ticks = 0U;
+static uint64_t               s_elapsed_wall_ticks = 0ULL;
 
 /* Calibration constants */
 #define PROFILER_CALIBRATION_DEPTH (2U)
@@ -212,9 +227,11 @@ NO_INST static void clear_state(void)
     s_nested_overhead = 0U;
     s_calibrating = false;
     s_calibration_owner = NULL;
+    s_last_wall_ticks = 0U;
+    s_elapsed_wall_ticks = 0ULL;
 }
 
-NO_INST bool profiler_init(uint32_t frequency)
+NO_INST bool profiler_init(uint32_t frequency, void* transport_device)
 {
     if (frequency == 0U) {
         return false;
@@ -236,6 +253,13 @@ NO_INST bool profiler_init(uint32_t frequency)
     }
 
     profiler_port_init();
+
+    if (transport_device != NULL) {
+        if (profiler_transport_init(transport_device) != PROFILER_TRANSPORT_STATUS_OK) {
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -278,9 +302,11 @@ NO_INST void profiler_start(void)
     uint32_t state = profiler_port_enter_critical();
     if (!s_enabled) {
         reset_all_contexts(false);
+        s_last_wall_ticks = profiler_port_ticks();
         s_enabled = true;
         if (s_probe_overhead == 0U) {
             calibrate_probe();
+            s_last_wall_ticks = profiler_port_ticks();
         }
     }
     profiler_port_exit_critical(state);
@@ -289,7 +315,12 @@ NO_INST void profiler_start(void)
 NO_INST void profiler_stop(void)
 {
     uint32_t state = profiler_port_enter_critical();
-    s_enabled = false;
+    if (s_enabled) {
+        uint32_t now = profiler_port_ticks();
+        s_elapsed_wall_ticks += (uint64_t)(now - s_last_wall_ticks);
+        s_last_wall_ticks = now;
+        s_enabled = false;
+    }
     profiler_port_exit_critical(state);
 }
 
@@ -303,6 +334,8 @@ NO_INST void profiler_reset(void)
     s_unmatched_exits = 0U;
     s_stale_frames = 0U;
     s_context_overflows = 0U;
+    s_elapsed_wall_ticks = 0ULL;
+    s_last_wall_ticks = profiler_port_ticks();
     (void)memset(s_metrics, 0, sizeof(s_metrics));
     hashmap_clear(&s_map);
     reset_all_contexts(true);
@@ -537,7 +570,12 @@ NO_INST bool profiler_dump(const struct Stream* stream, ProfilerDumpFormat forma
 
     uint32_t state = profiler_port_enter_critical();
     bool was_enabled = s_enabled;
-    s_enabled = false;
+    if (s_enabled) {
+        uint32_t now = profiler_port_ticks();
+        s_elapsed_wall_ticks += (uint64_t)(now - s_last_wall_ticks);
+        s_last_wall_ticks = now;
+        s_enabled = false;
+    }
     profiler_port_exit_critical(state);
 
     bool success = true;
@@ -604,32 +642,124 @@ NO_INST bool profiler_dump(const struct Stream* stream, ProfilerDumpFormat forma
             }
         }
     } else { /* PROFILER_DUMP_TOP */
-        static const char top_header[] =
-            "\r\n--- PROFILER RUNTIME METRICS ---\r\n"
-            "Function                         Calls      Min      Max      Avg\r\n"
-            "-----------------------------------------------------------------\r\n";
-        (void)stream_write(stream, (const uint8_t*)top_header, sizeof(top_header) - 1U);
+        /* Sum total active cycles across all functions and count active entries */
+        uint64_t total_active_cycles = 0ULL;
+        uint64_t total_calls = 0ULL;
+        size_t active_count = 0U;
+        uint8_t order[PROFILER_CAPACITY_FUNCTIONS];
 
+        for (size_t i = 0U; i < s_metrics_count; ++i) {
+            if (s_metrics[i].call_count > 0U) {
+                total_active_cycles += s_metrics[i].total_cycles;
+                total_calls += s_metrics[i].call_count;
+                order[active_count] = (uint8_t)i;
+                active_count++;
+            }
+        }
+
+        /* Stable insertion sort of active indices by total_cycles descending */
+        for (size_t i = 1U; i < active_count; ++i) {
+            uint8_t key = order[i];
+            size_t j = i;
+            while ((j > 0U) && (s_metrics[order[j - 1U]].total_cycles < s_metrics[key].total_cycles)) {
+                order[j] = order[j - 1U];
+                j--;
+            }
+            order[j] = key;
+        }
+
+        /* Header banner with CPU frequency and measurement units */
+        static const char banner_top[] =
+            "\r\n=== PROFILER RUNTIME METRICS [CPU: ";
+        static const char banner_cols[] =
+            "] ==================\r\n"
+            "Function                         Calls     Total (kcyc)   %Work    Min    Max    Avg   Jitter\r\n"
+            "-------------------------------------------------------------------------------------------\r\n";
+        (void)stream_write(stream, (const uint8_t*)banner_top, sizeof(banner_top) - 1U);
+
+        char freq_str[32];
+        uint32_t freq_mhz_x10 = (s_frequency > 0U) ? (s_frequency / 100000U) : 0U;
+        int freq_len = snprintf(freq_str, sizeof(freq_str), "%lu.%1lu MHz | Units: Cycles",
+            (unsigned long)(freq_mhz_x10 / 10U),
+            (unsigned long)(freq_mhz_x10 % 10U));
+        if (freq_len > 0) {
+            (void)stream_write(stream, (const uint8_t*)freq_str, (size_t)freq_len);
+        }
+        (void)stream_write(stream, (const uint8_t*)banner_cols, sizeof(banner_cols) - 1U);
+
+        /* Rows in sorted order */
         char line[128];
         char fn_str[36];
-        for (size_t i = 0U; i < s_metrics_count; ++i) {
+        for (size_t idx = 0U; idx < active_count; ++idx) {
+            size_t i = order[idx];
             format_fn_name(&s_metrics[i], fn_str, sizeof(fn_str));
+
             uint32_t avg = (s_metrics[i].call_count > 0U) ?
                 (uint32_t)(s_metrics[i].total_cycles / (uint64_t)s_metrics[i].call_count) : 0U;
+            uint32_t jitter = (s_metrics[i].max_cycles >= s_metrics[i].min_cycles) ?
+                (s_metrics[i].max_cycles - s_metrics[i].min_cycles) : 0U;
+            uint32_t pct_x10 = (total_active_cycles > 0ULL) ?
+                (uint32_t)((s_metrics[i].total_cycles * 1000ULL) / total_active_cycles) : 0U;
+            bool outlier = (jitter > (avg / 10U)) && (jitter > 5U);
 
-            int len = snprintf(line, sizeof(line), "%-31s %7lu %8lu %8lu %8lu\r\n",
-                               fn_str,
-                               (unsigned long)s_metrics[i].call_count,
-                               (unsigned long)s_metrics[i].min_cycles,
-                               (unsigned long)s_metrics[i].max_cycles,
-                               (unsigned long)avg);
+            int len = snprintf(line, sizeof(line),
+                "%-30s %8lu %16lu %4lu.%1lu%% %6lu %6lu %6lu   +%-5lu %s\r\n",
+                fn_str,
+                (unsigned long)s_metrics[i].call_count,
+                (unsigned long)(s_metrics[i].total_cycles / 1000ULL),
+                (unsigned long)(pct_x10 / 10U),
+                (unsigned long)(pct_x10 % 10U),
+                (unsigned long)s_metrics[i].min_cycles,
+                (unsigned long)s_metrics[i].max_cycles,
+                (unsigned long)avg,
+                (unsigned long)jitter,
+                outlier ? "!" : " ");
             if (len > 0) {
                 (void)stream_write(stream, (const uint8_t*)line, (size_t)len);
             }
         }
-        static const char top_footer[] =
-            "-----------------------------------------------------------------\r\n\r\n";
-        (void)stream_write(stream, (const uint8_t*)top_footer, sizeof(top_footer) - 1U);
+
+        /* Summary and Health Diagnostic Footer */
+        static const char div_line[] =
+            "-------------------------------------------------------------------------------------------\r\n";
+        (void)stream_write(stream, (const uint8_t*)div_line, sizeof(div_line) - 1U);
+
+        char foot_buf[256];
+        uint32_t sys_load_x10 = (s_elapsed_wall_ticks > 0ULL) ?
+            (uint32_t)((total_active_cycles * 1000ULL) / s_elapsed_wall_ticks) : 0U;
+        if (sys_load_x10 > 1000U) {
+            sys_load_x10 = 1000U;
+        }
+        uint32_t idle_x10 = 1000U - sys_load_x10;
+
+        uint32_t elapsed_sec_x100 = (s_frequency > 0U) ?
+            (uint32_t)((s_elapsed_wall_ticks * 100ULL) / (uint64_t)s_frequency) : 0U;
+        uint32_t total_mcyc_x10 = (uint32_t)(total_active_cycles / 100000ULL);
+
+        int foot_len = snprintf(foot_buf, sizeof(foot_buf),
+            "System Utilization: [Active Load: %lu.%1lu%% | Idle / Sleep: %lu.%1lu%%]\r\n"
+            "Scope Summary:      %u active functions | %lu calls | Active: %lu.%1luM cyc | Elapsed: %lu.%02lu s\r\n"
+            "Health:             %u dropped | %u stack overflows | Calibrated probe overhead: %u cyc\r\n",
+            (unsigned long)(sys_load_x10 / 10U),
+            (unsigned long)(sys_load_x10 % 10U),
+            (unsigned long)(idle_x10 / 10U),
+            (unsigned long)(idle_x10 % 10U),
+            (unsigned int)active_count,
+            (unsigned long)total_calls,
+            (unsigned long)(total_mcyc_x10 / 10U),
+            (unsigned long)(total_mcyc_x10 % 10U),
+            (unsigned long)(elapsed_sec_x100 / 100U),
+            (unsigned long)(elapsed_sec_x100 % 100U),
+            (unsigned int)s_dropped_functions,
+            (unsigned int)s_stack_overflows,
+            (unsigned int)s_probe_overhead);
+        if (foot_len > 0) {
+            (void)stream_write(stream, (const uint8_t*)foot_buf, (size_t)foot_len);
+        }
+
+        static const char end_bar[] =
+            "===========================================================================================\r\n\r\n";
+        (void)stream_write(stream, (const uint8_t*)end_bar, sizeof(end_bar) - 1U);
     }
 
     stream_flush(stream);
@@ -637,6 +767,7 @@ NO_INST bool profiler_dump(const struct Stream* stream, ProfilerDumpFormat forma
     state = profiler_port_enter_critical();
     if (was_enabled) {
         reset_all_contexts(false);
+        s_last_wall_ticks = profiler_port_ticks();
         s_enabled = true;
     }
     profiler_port_exit_critical(state);
@@ -672,26 +803,31 @@ NO_INST bool profiler_cmd_execute(const char* cmd, const struct Stream* stream)
 
     len = last - first;
 
-    /* Profiler commands MUST start with "prof-" */
-    if ((len < 5U) || (strncmp(&cmd[first], "prof-", 5U) != 0)) {
+    /* Profiler commands start with "prof-" or legacy "live" */
+    if ((len >= 5U) && (strncmp(&cmd[first], "prof-", 5U) == 0)) {
+        opt = &cmd[first + 5U];
+        opt_len = len - 5U;
+    } else if ((len == 4U) && (strncmp(&cmd[first], "live", 4U) == 0)) {
+        opt = &cmd[first];
+        opt_len = 4U;
+    } else {
         return false;
     }
-
-    opt = &cmd[first + 5U];
-    opt_len = len - 5U;
 
     if ((opt_len == 4U) && (strncmp(opt, "dump", 4U) == 0)) {
         profiler_stop();
         (void)profiler_dump(stream, PROFILER_DUMP_BIN);
         profiler_start();
         return true;
-    } else if ((opt_len == 3U) && (strncmp(opt, "top", 3U) == 0)) {
+    } else if (((opt_len == 3U) && (strncmp(opt, "top", 3U) == 0)) ||
+               ((opt_len == 4U) && (strncmp(opt, "live", 4U) == 0))) {
         profiler_stop();
         (void)profiler_dump(stream, PROFILER_DUMP_TOP);
         profiler_start();
         return true;
     } else if ((opt_len == 5U) && (strncmp(opt, "reset", 5U) == 0)) {
         profiler_reset();
+        profiler_start();
         static const char reset_msg[] = "OK: profiler reset\r\n";
         (void)stream_write(stream, (const uint8_t*)reset_msg, sizeof(reset_msg) - 1U);
         stream_flush(stream);
@@ -764,4 +900,16 @@ NO_INST bool profiler_stream_process(const struct Stream* stream)
     }
 
     return handled;
+}
+
+NO_INST bool profiler_process(void)
+{
+    uint32_t state = profiler_port_enter_critical();
+    if (s_enabled) {
+        uint32_t now = profiler_port_ticks();
+        s_elapsed_wall_ticks += (uint64_t)(now - s_last_wall_ticks);
+        s_last_wall_ticks = now;
+    }
+    profiler_port_exit_critical(state);
+    return profiler_transport_process();
 }

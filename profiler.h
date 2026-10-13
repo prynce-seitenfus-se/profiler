@@ -85,15 +85,29 @@ extern "C" {
 #endif
 
 /**
- * @brief Initializes the profiler engine.
+ * @brief Initializes the profiler engine and optional transport backend.
  *
  * Allocates all hashmap entries, metrics, shadow stacks, and context tables
  * internally within the library (capacity: 128 functions, 16 stack depth, 8 contexts).
+ * If a non-NULL transport_device is provided (e.g. &huart2), the selected transport
+ * backend is initialized automatically. Pass NULL for headless or standalone operation.
  *
- * @param frequency Clock frequency in Hz of the timestamp counter.
- * @return true if initialized successfully, false on invalid parameter.
+ * @param frequency        Clock frequency in Hz of the timestamp counter.
+ * @param transport_device Optional device handle for the transport backend (e.g. &huart2),
+ *                         or NULL if no transport is desired / standalone operation.
+ * @return true if initialized successfully, false on invalid parameter or transport failure.
  */
-NO_INST bool profiler_init(uint32_t frequency);
+NO_INST bool profiler_init(uint32_t frequency, void* transport_device);
+
+/**
+ * @brief Processes incoming profiler commands over the active transport.
+ *
+ * Safe to call from the application main loop. If no transport was initialized,
+ * this function is a safe no-op returning false.
+ *
+ * @return true if a profiler command was processed, false otherwise.
+ */
+NO_INST bool profiler_process(void);
 
 /**
  * @brief Starts profiling by enabling instrumentation hooks.
