@@ -11,10 +11,12 @@ NO_INST uint32_t profiler_port_ticks(void)
     uint16_t low = profiler_port_hardware_timer16_read_low();
     uint16_t high_after = profiler_port_hardware_timer16_read_high();
 
-    /* If slave timer cascaded while sampling low timer, re-read */
+    /* Keep the original low-counter sample point on both sides of a wrap.
+     * Sampling must finish within half a low-counter period. */
     if (high_before != high_after) {
-        low = profiler_port_hardware_timer16_read_low();
-        high_before = high_after;
+        if (low < 0x8000U) {
+            high_before = high_after;
+        }
     }
 
     return ((uint32_t)high_before << 16U) | (uint32_t)low;

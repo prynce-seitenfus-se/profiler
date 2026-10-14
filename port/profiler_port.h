@@ -44,10 +44,9 @@ NO_INST void profiler_port_exit_critical(uint32_t state);
 /**
  * @brief Returns an opaque identifier of the current execution context.
  *
- * Used only in per-context mode (ProfilerConfig.contexts != NULL). RTOS
- * integrations return the running task handle, or PROFILER_CONTEXT_ISR in
- * handler mode. The weak default (profiler_port_context_default.c) returns NULL,
- * which maps every event to a single context.
+ * RTOS integrations return the running task handle, or PROFILER_CONTEXT_ISR in
+ * handler mode. NULL selects the independent bare-metal context. The weak
+ * default (profiler_port_context_default.c) returns NULL for every event.
  *
  * @return Context identifier.
  */

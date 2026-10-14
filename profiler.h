@@ -20,55 +20,8 @@ struct Stream;
  */
 #define PROFILER_CONTEXT_ISR  ((const void*)1U)
 
-/**
- * @brief Converts a function designator into a scope identifier (its code address).
- */
-#define PROFILER_FN_ID(fn)    ((const void*)(uintptr_t)(fn))
-
-/**
- * @brief Measures one call site with an explicit scope (no compiler instrumentation).
- * Transparently captures the function name symbol without exposing separate macros.
- */
 #ifdef PROFILER_SCOPES_ENABLED
-NO_INST void profiler_scope_enter(const void* id, const char* name);
-NO_INST void profiler_scope_exit(const void* id);
-
-#define PROFILER_SCOPE(fn, call)                          \
-    do {                                                  \
-        profiler_scope_enter(PROFILER_FN_ID(fn), #fn);    \
-        call;                                             \
-        profiler_scope_exit(PROFILER_FN_ID(fn));          \
-    } while (0)
-
-NO_INST static inline void _profiler_function_cleanup(const void* const* token)
-{
-    if ((token != NULL) && (*token != NULL)) {
-        profiler_scope_exit(*token);
-    }
-}
-
-/**
- * @brief Automatically measures the current function with zero boilerplate.
- *
- * Places a single-line probe at the beginning of the function body.
- * Automatically captures __func__ as function name and unique scope ID.
- * Automatically invokes profiler_scope_exit() upon return via GCC/Clang cleanup attribute.
- */
-#define PROFILER_FUNCTION() \
-    const void* _prof_scope_token __attribute__((cleanup(_profiler_function_cleanup), unused)) = (const void*)__func__; \
-    profiler_scope_enter(_prof_scope_token, __func__)
-
-/**
- * @brief Measures the current function using an explicit custom name string literal.
- */
-#define PROFILER_FUNCTION_NAMED(name) \
-    const void* _prof_scope_token __attribute__((cleanup(_profiler_function_cleanup), unused)) = (const void*)(name); \
-    profiler_scope_enter(_prof_scope_token, name)
-
-#else
-#define PROFILER_SCOPE(fn, call) do { call; } while (0)
-#define PROFILER_FUNCTION() do {} while (0)
-#define PROFILER_FUNCTION_NAMED(name) do {} while (0)
+#error "Profiler scopes were removed; compile application code with -finstrument-functions."
 #endif
 
 /**
@@ -77,7 +30,7 @@ NO_INST static inline void _profiler_function_cleanup(const void* const* token)
 typedef enum ProfilerDumpFormat {
     PROFILER_DUMP_BIN = 0, /**< Compact PROF-BIN v4 binary format with CRC32 */
     PROFILER_DUMP_CSV = 1, /**< ASCII CSV: function,calls,min,max,avg */
-    PROFILER_DUMP_TOP = 2  /**< ASCII terminal table view with function names */
+    PROFILER_DUMP_TOP = 2  /**< ASCII terminal table view with function addresses */
 } ProfilerDumpFormat;
 
 #ifdef __cplusplus
@@ -111,6 +64,11 @@ NO_INST bool profiler_process(void);
 
 /**
  * @brief Starts profiling by enabling instrumentation hooks.
+ *
+ * First-start calibration masks interrupts for one sample at a time, permitting
+ * interrupts/context switches between samples. Normal measurements remain disabled
+ * until calibration completes. A concurrent start is ignored; stop/reset cancels
+ * pending calibration. An already-masked caller retains its original mask.
  */
 NO_INST void profiler_start(void);
 
@@ -148,19 +106,18 @@ NO_INST uint32_t profiler_frequency(void);
 NO_INST bool profiler_dump(const struct Stream* stream, ProfilerDumpFormat format);
 
 /**
- * @brief Opens an explicit measurement scope.
- *
- * @param[in] id   Scope identifier, normally PROFILER_FN_ID(function).
- * @param[in] name Optional human-readable function name string literal.
+ * @brief Compiler-generated function entry hook; do not call from application code.
+ * @param[in] this_fn Function address supplied by -finstrument-functions.
+ * @param[in] call_site Caller address (currently unused).
  */
-NO_INST void profiler_scope_enter(const void* id, const char* name);
+NO_INST void __cyg_profile_func_enter(void* this_fn, void* call_site);
 
 /**
- * @brief Closes the scope opened by profiler_scope_enter() with the same id.
- *
- * @param[in] id Scope identifier passed to profiler_scope_enter().
+ * @brief Compiler-generated function exit hook; do not call from application code.
+ * @param[in] this_fn Function address supplied by -finstrument-functions.
+ * @param[in] call_site Caller address (currently unused).
  */
-NO_INST void profiler_scope_exit(const void* id);
+NO_INST void __cyg_profile_func_exit(void* this_fn, void* call_site);
 
 /**
  * @brief Notifies the profiler of an RTOS context switch.

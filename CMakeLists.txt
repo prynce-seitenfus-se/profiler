@@ -88,6 +88,7 @@ endif()
 add_library(profiler STATIC
     ${PROFILER_LIB_SOURCES}
 )
+target_compile_definitions(profiler PRIVATE PROFILER_HAS_TRANSPORT=1)
 
 target_include_directories(profiler PUBLIC
     "${CMAKE_CURRENT_LIST_DIR}"
@@ -101,3 +102,24 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 message(STATUS "Profiler transport: ${PROFILER_TRANSPORT}")
+
+# GCC exclusions match substrings, not globs. Keep the entire hook dependency path excluded.
+function(profiler_instrument_target target)
+    cmake_parse_arguments(INSTR "" "" "EXCLUDE_FILES;EXCLUDE_FUNCTIONS" ${ARGN})
+    if(INSTR_UNPARSED_ARGUMENTS OR NOT TARGET ${target})
+        message(FATAL_ERROR "profiler_instrument_target requires an existing target and valid exclusion lists")
+    endif()
+    if(NOT CMAKE_C_COMPILER_ID STREQUAL "GNU")
+        message(FATAL_ERROR "profiler_instrument_target requires GCC; for Clang use per-source instrumentation and NO_INST")
+    endif()
+    set(files profiler.c profiler_port profiler_context profiler_transport
+        hashmap.c stream.c Drivers CMSIS system_stm32 startup_ ${INSTR_EXCLUDE_FILES})
+    set(functions main SystemInit SystemClock_Config Error_Handler assert_failed
+        HAL_TIM_PeriodElapsedCallback ${INSTR_EXCLUDE_FUNCTIONS})
+    list(JOIN files "," files)
+    list(JOIN functions "," functions)
+    target_compile_options(${target} PRIVATE
+        "$<$<COMPILE_LANGUAGE:C>:-finstrument-functions>"
+        "$<$<COMPILE_LANGUAGE:C>:-finstrument-functions-exclude-file-list=${files}>"
+        "$<$<COMPILE_LANGUAGE:C>:-finstrument-functions-exclude-function-list=${functions}>")
+endfunction()

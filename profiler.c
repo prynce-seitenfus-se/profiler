@@ -7,6 +7,7 @@
 #include <stdio.h>
 
 /* Weak fallback for builds without a transport backend */
+#ifndef PROFILER_HAS_TRANSPORT
 __attribute__((weak)) NO_INST ProfilerTransportStatus profiler_transport_init(void* device)
 {
     (void)device;
@@ -17,19 +18,31 @@ __attribute__((weak)) NO_INST bool profiler_transport_process(void)
 {
     return false;
 }
+#endif
 
+#ifndef PROFILER_CAPACITY_FUNCTIONS
 #define PROFILER_CAPACITY_FUNCTIONS (128U)
+#endif
+#ifndef PROFILER_CAPACITY_STACK
 #define PROFILER_CAPACITY_STACK     (16U)
+#endif
+#ifndef PROFILER_CAPACITY_CONTEXTS
 #define PROFILER_CAPACITY_CONTEXTS  (8U)
+#endif
+#if (PROFILER_CAPACITY_FUNCTIONS == 0U) || \
+    ((PROFILER_CAPACITY_FUNCTIONS & (PROFILER_CAPACITY_FUNCTIONS - 1U)) != 0U) || \
+    (PROFILER_CAPACITY_FUNCTIONS > 65535U) || \
+    (PROFILER_CAPACITY_STACK == 0U) || (PROFILER_CAPACITY_CONTEXTS == 0U)
+#error "Profiler capacities require a power-of-two function count (1..32768) and nonzero stack/context counts."
+#endif
 
-/* Internal metric record with captured function name */
+/* Internal metric record keyed by function address */
 typedef struct ProfilerInternalMetric {
     uint32_t    fn_address;   /**< Unique function code address (key). */
     uint32_t    call_count;   /**< Total number of completed invocations. */
     uint64_t    total_cycles; /**< Accumulated execution time in CPU cycles. */
     uint32_t    min_cycles;   /**< Minimum observed execution duration in cycles. */
     uint32_t    max_cycles;   /**< Maximum observed execution duration in cycles. */
-    const char* name;         /**< Captured function name literal (or NULL). */
 } ProfilerInternalMetric;
 
 /* Binary protocol record format (matches PROF-BIN v4: 24 bytes) */
@@ -45,23 +58,22 @@ typedef struct ProfilerBinRecord {
 typedef struct ProfilerBinHeader {
     uint32_t magic;             /**< "PROF" magic identifier. */
     uint16_t version;           /**< Protocol version (0x0004U). */
-    uint16_t record_count;      /**< Number of ProfilerMetric records following header. */
+    uint16_t record_count;      /**< Number of binary metric records following header. */
     uint32_t frequency;         /**< Timestamp clock frequency in Hz. */
     uint16_t dropped_functions; /**< Unique functions dropped due to capacity exhaustion. */
     uint16_t stack_overflows;   /**< Calls dropped due to shadow call stack overflow. */
     uint16_t unmatched_exits;   /**< Exits without a matching entry frame (saturating). */
     uint16_t stale_frames;      /**< Frames discarded because their exit was never seen (saturating). */
     uint16_t context_overflows; /**< Events dropped because no context slot was free (saturating). */
-    uint8_t  time_mode;         /**< ProfilerTimeMode used for the recorded durations. */
+    uint8_t  time_mode;         /**< Active-time protocol marker (1). */
     uint8_t  reserved;          /**< Reserved, always 0. */
-    uint16_t probe_overhead;    /**< Calibrated scope window overhead subtracted from scope durations. */
-    uint16_t nested_overhead;   /**< Calibrated untracked cost of one nested scope pair subtracted from callers. */
+    uint16_t probe_overhead;    /**< Calibrated hook-window overhead subtracted from durations. */
+    uint16_t nested_overhead;   /**< Calibrated untracked nested hook cost subtracted from callers. */
 } ProfilerBinHeader;
 
 /* Shadow call stack frame */
 typedef struct ProfilerStackFrame {
     const void* fn_address;
-    const char* name;
     uint32_t    enter_timestamp;
     uint32_t    enter_suspended;
     uint32_t    enter_probe;
@@ -72,6 +84,7 @@ typedef struct ProfilerContext {
     const void*         id;
     ProfilerStackFrame* frames;
     size_t              index;
+    size_t              overflow_depth;
     uint32_t            suspended_cycles;
     uint32_t            switch_out_ts;
     uint32_t            probe_cycles;
@@ -81,11 +94,12 @@ typedef struct ProfilerContext {
 
 /* Pre-allocated static storage (zero heap allocation, completely internal) */
 static HashMap                s_map;
-static HashMapEntry           s_map_entries[PROFILER_CAPACITY_FUNCTIONS];
+/* HashMap limits occupancy to 75%; reserve enough slots for every metric. */
+static HashMapEntry           s_map_entries[PROFILER_CAPACITY_FUNCTIONS * 2U];
 static ProfilerInternalMetric s_metrics[PROFILER_CAPACITY_FUNCTIONS];
 static size_t                 s_metrics_count = 0U;
 
-static ProfilerStackFrame     s_stack_pool[PROFILER_CAPACITY_CONTEXTS * PROFILER_CAPACITY_STACK];
+static ProfilerStackFrame     s_stack_pool[(PROFILER_CAPACITY_CONTEXTS + 1U) * PROFILER_CAPACITY_STACK];
 static ProfilerContext        s_contexts[PROFILER_CAPACITY_CONTEXTS];
 static ProfilerContext        s_legacy_context;
 
@@ -104,6 +118,7 @@ static uint64_t               s_elapsed_wall_ticks = 0ULL;
 static uint32_t               s_probe_overhead = 0U;
 static uint32_t               s_nested_overhead = 0U;
 static volatile bool          s_calibrating = false;
+static volatile bool          s_calibration_cancelled = false;
 static const void*            s_calibration_owner = NULL;
 static uint32_t               s_calibration_probe = 0U;
 static uint32_t               s_calibration_nested = 0U;
@@ -145,6 +160,7 @@ NO_INST static void saturating_increment(uint16_t* counter)
 NO_INST static void reset_context(ProfilerContext* ctx, bool unbind)
 {
     ctx->index = 0U;
+    ctx->overflow_depth = 0U;
     ctx->switched_out = false;
     if (unbind) {
         ctx->id = NULL;
@@ -158,6 +174,7 @@ NO_INST static void reset_context(ProfilerContext* ctx, bool unbind)
 NO_INST static void reset_all_contexts(bool unbind)
 {
     s_legacy_context.index = 0U;
+    s_legacy_context.overflow_depth = 0U;
     s_legacy_context.switched_out = false;
 
     for (size_t i = 0U; i < PROFILER_CAPACITY_CONTEXTS; ++i) {
@@ -226,6 +243,7 @@ NO_INST static void clear_state(void)
     s_probe_overhead = 0U;
     s_nested_overhead = 0U;
     s_calibrating = false;
+    s_calibration_cancelled = false;
     s_calibration_owner = NULL;
     s_last_wall_ticks = 0U;
     s_elapsed_wall_ticks = 0ULL;
@@ -239,7 +257,7 @@ NO_INST bool profiler_init(uint32_t frequency, void* transport_device)
 
     clear_state();
 
-    if (!hashmap_init(&s_map, s_map_entries, PROFILER_CAPACITY_FUNCTIONS)) {
+    if (!hashmap_init(&s_map, s_map_entries, PROFILER_CAPACITY_FUNCTIONS * 2U)) {
         return false;
     }
 
@@ -249,7 +267,7 @@ NO_INST bool profiler_init(uint32_t frequency, void* transport_device)
     s_legacy_context.in_use = true;
 
     for (size_t i = 0U; i < PROFILER_CAPACITY_CONTEXTS; ++i) {
-        s_contexts[i].frames = &s_stack_pool[i * PROFILER_CAPACITY_STACK];
+        s_contexts[i].frames = &s_stack_pool[(i + 1U) * PROFILER_CAPACITY_STACK];
     }
 
     profiler_port_init();
@@ -263,9 +281,8 @@ NO_INST bool profiler_init(uint32_t frequency, void* transport_device)
     return true;
 }
 
-NO_INST static void calibrate_probe(void)
+NO_INST static bool calibrate_probe(uint32_t* probe, uint32_t* nested)
 {
-    s_calibration_owner = profiler_port_context_id();
     (void)memset(&s_calibration_context, 0, sizeof(s_calibration_context));
     s_calibration_context.frames = s_calibration_frames;
     s_calibration_context.in_use = true;
@@ -275,38 +292,63 @@ NO_INST static void calibrate_probe(void)
     s_calibration_nested = 0U;
     s_calibration_min = UINT32_MAX;
 
-    s_calibrating = true;
-
     for (size_t i = 0U; i < 16U; ++i) {
-        profiler_scope_enter((const void*)&s_calibration_ids[0], NULL);
-        profiler_scope_exit((const void*)&s_calibration_ids[0]);
+        uint32_t state = profiler_port_enter_critical();
+        if (s_calibration_cancelled) {
+            profiler_port_exit_critical(state);
+            return false;
+        }
+        __cyg_profile_func_enter((void*)&s_calibration_ids[0], NULL);
+        __cyg_profile_func_exit((void*)&s_calibration_ids[0], NULL);
+        profiler_port_exit_critical(state);
     }
-    s_probe_overhead = (s_calibration_min == UINT32_MAX) ? 0U : s_calibration_min;
-    s_calibration_probe = s_probe_overhead;
+    *probe = (s_calibration_min == UINT32_MAX) ? 0U : s_calibration_min;
+    s_calibration_probe = *probe;
 
     s_calibration_min = UINT32_MAX;
     for (size_t i = 0U; i < 16U; ++i) {
-        profiler_scope_enter((const void*)&s_calibration_ids[0], NULL);
-        profiler_scope_enter((const void*)&s_calibration_ids[1], NULL);
-        profiler_scope_exit((const void*)&s_calibration_ids[1]);
-        profiler_scope_exit((const void*)&s_calibration_ids[0]);
+        uint32_t state = profiler_port_enter_critical();
+        if (s_calibration_cancelled) {
+            profiler_port_exit_critical(state);
+            return false;
+        }
+        __cyg_profile_func_enter((void*)&s_calibration_ids[0], NULL);
+        __cyg_profile_func_enter((void*)&s_calibration_ids[1], NULL);
+        __cyg_profile_func_exit((void*)&s_calibration_ids[1], NULL);
+        __cyg_profile_func_exit((void*)&s_calibration_ids[0], NULL);
+        profiler_port_exit_critical(state);
     }
-    s_nested_overhead = (s_calibration_min == UINT32_MAX) ? 0U : s_calibration_min;
-
-    s_calibrating = false;
-    s_calibration_owner = NULL;
+    *nested = (s_calibration_min == UINT32_MAX) ? 0U : s_calibration_min;
+    return true;
 }
 
 NO_INST void profiler_start(void)
 {
     uint32_t state = profiler_port_enter_critical();
-    if (!s_enabled) {
+    if (!s_enabled && !s_calibrating && (s_frequency != 0U)) {
         reset_all_contexts(false);
-        s_last_wall_ticks = profiler_port_ticks();
-        s_enabled = true;
         if (s_probe_overhead == 0U) {
-            calibrate_probe();
+            s_calibration_owner = profiler_port_context_id();
+            s_calibration_cancelled = false;
+            s_calibrating = true;
+            profiler_port_exit_critical(state);
+
+            uint32_t probe = 0U;
+            uint32_t nested = 0U;
+            bool calibrated = calibrate_probe(&probe, &nested);
+
+            state = profiler_port_enter_critical();
+            if (calibrated && !s_calibration_cancelled) {
+                s_probe_overhead = probe;
+                s_nested_overhead = nested;
+                s_last_wall_ticks = profiler_port_ticks();
+                s_enabled = true;
+            }
+            s_calibrating = false;
+            s_calibration_owner = NULL;
+        } else {
             s_last_wall_ticks = profiler_port_ticks();
+            s_enabled = true;
         }
     }
     profiler_port_exit_critical(state);
@@ -315,6 +357,9 @@ NO_INST void profiler_start(void)
 NO_INST void profiler_stop(void)
 {
     uint32_t state = profiler_port_enter_critical();
+    if (s_calibrating) {
+        s_calibration_cancelled = true;
+    }
     if (s_enabled) {
         uint32_t now = profiler_port_ticks();
         s_elapsed_wall_ticks += (uint64_t)(now - s_last_wall_ticks);
@@ -327,6 +372,9 @@ NO_INST void profiler_stop(void)
 NO_INST void profiler_reset(void)
 {
     uint32_t state = profiler_port_enter_critical();
+    if (s_calibrating) {
+        s_calibration_cancelled = true;
+    }
     s_enabled = false;
     s_metrics_count = 0U;
     s_dropped_functions = 0U;
@@ -386,7 +434,7 @@ NO_INST void profiler_context_release(const void* id)
     profiler_port_exit_critical(state);
 }
 
-NO_INST static void update_metric(const void* fn_addr, const char* name, uint32_t cycles)
+NO_INST static void update_metric(const void* fn_addr, uint32_t cycles)
 {
     void** slot = hashmap_get_ref(&s_map, fn_addr);
 
@@ -400,9 +448,6 @@ NO_INST static void update_metric(const void* fn_addr, const char* name, uint32_
         if (cycles > metric->max_cycles) {
             metric->max_cycles = cycles;
         }
-        if ((metric->name == NULL) && (name != NULL)) {
-            metric->name = name;
-        }
     } else if (s_metrics_count < PROFILER_CAPACITY_FUNCTIONS) {
         ProfilerInternalMetric* metric = &s_metrics[s_metrics_count];
         metric->fn_address = (uint32_t)(uintptr_t)fn_addr;
@@ -410,7 +455,6 @@ NO_INST static void update_metric(const void* fn_addr, const char* name, uint32_
         metric->total_cycles = (uint64_t)cycles;
         metric->min_cycles = cycles;
         metric->max_cycles = cycles;
-        metric->name = name;
 
         if (hashmap_insert(&s_map, fn_addr, (void*)metric)) {
             s_metrics_count++;
@@ -444,12 +488,12 @@ NO_INST static uint32_t frame_cycles(const ProfilerContext* ctx, const ProfilerS
     return cycles;
 }
 
-NO_INST static void record_call(const ProfilerContext* ctx, const void* fn, const char* name, uint32_t cycles, uint32_t overhead)
+NO_INST static void record_call(const ProfilerContext* ctx, const void* fn, uint32_t cycles, uint32_t overhead)
 {
     uint32_t net = (overhead < cycles) ? (cycles - overhead) : 0U;
 
     if (ctx != &s_calibration_context) {
-        update_metric(fn, name, net);
+        update_metric(fn, net);
     } else if ((fn == (const void*)&s_calibration_ids[0]) && (net < s_calibration_min)) {
         s_calibration_min = net;
     }
@@ -464,9 +508,8 @@ NO_INST static void pop_context_frame(ProfilerContext* ctx, const void* fn, uint
     }
 
     size_t match_idx = match_pos - 1U;
-    const char* name = ctx->frames[match_idx].name;
     uint32_t cycles = frame_cycles(ctx, &ctx->frames[match_idx], ts);
-    record_call(ctx, fn, name, cycles, overhead);
+    record_call(ctx, fn, cycles, overhead);
 
     size_t discarded = ctx->index - match_pos;
     if (discarded > 0U) {
@@ -475,34 +518,41 @@ NO_INST static void pop_context_frame(ProfilerContext* ctx, const void* fn, uint
     ctx->index = match_idx;
 }
 
-NO_INST static ProfilerContext* scope_context(void)
+NO_INST static ProfilerContext* hook_context(void)
 {
     if (s_calibrating && (profiler_port_context_id() == s_calibration_owner)) {
         return &s_calibration_context;
     }
+    if (!s_enabled) {
+        return NULL;
+    }
     return current_context();
 }
 
-NO_INST __attribute__((noinline)) void profiler_scope_enter(const void* id, const char* name)
+NO_INST __attribute__((noinline)) void __cyg_profile_func_enter(void* this_fn, void* call_site)
 {
-    if (!s_enabled || (id == NULL)) {
+    const void* id = this_fn;
+    (void)call_site;
+    if ((!s_enabled && !s_calibrating) || (id == NULL)) {
         return;
     }
 
     uint32_t state = profiler_port_enter_critical();
     uint32_t start = profiler_port_ticks();
-    ProfilerContext* ctx = scope_context();
+    ProfilerContext* ctx = hook_context();
 
     if (ctx != NULL) {
         size_t depth = (ctx == &s_calibration_context) ? PROFILER_CALIBRATION_DEPTH : PROFILER_CAPACITY_STACK;
         ProfilerStackFrame* frame = NULL;
-        if (ctx->index < depth) {
+        if ((ctx->overflow_depth == 0U) && (ctx->index < depth)) {
             frame = &ctx->frames[ctx->index];
             frame->fn_address = id;
-            frame->name = name;
             frame->enter_suspended = ctx->suspended_cycles;
             ctx->index++;
         } else {
+            if (ctx->overflow_depth < SIZE_MAX) {
+                ctx->overflow_depth++;
+            }
             saturating_increment(&s_stack_overflows);
         }
 
@@ -517,15 +567,24 @@ NO_INST __attribute__((noinline)) void profiler_scope_enter(const void* id, cons
     profiler_port_exit_critical(state);
 }
 
-NO_INST __attribute__((noinline)) void profiler_scope_exit(const void* id)
+NO_INST __attribute__((noinline)) void __cyg_profile_func_exit(void* this_fn, void* call_site)
 {
-    if (!s_enabled || (id == NULL)) {
+    const void* id = this_fn;
+    (void)call_site;
+    if ((!s_enabled && !s_calibrating) || (id == NULL)) {
         return;
     }
 
     uint32_t state = profiler_port_enter_critical();
     uint32_t ts = profiler_port_ticks();
-    ProfilerContext* ctx = scope_context();
+    ProfilerContext* ctx = hook_context();
+
+    if ((ctx != NULL) && (ctx->overflow_depth > 0U)) {
+        ctx->overflow_depth--;
+        ctx->probe_cycles += (profiler_port_ticks() - ts) + s_nested_overhead;
+        profiler_port_exit_critical(state);
+        return;
+    }
 
     if (ctx == &s_calibration_context) {
         pop_context_frame(ctx, id, ts, s_calibration_probe);
@@ -538,27 +597,10 @@ NO_INST __attribute__((noinline)) void profiler_scope_exit(const void* id)
     profiler_port_exit_critical(state);
 }
 
-/* GCC -finstrument-functions entry/exit hooks */
-NO_INST void __cyg_profile_func_enter(void* this_fn, void* call_site)
-{
-    (void)call_site;
-    profiler_scope_enter(this_fn, NULL);
-}
-
-NO_INST void __cyg_profile_func_exit(void* this_fn, void* call_site)
-{
-    (void)call_site;
-    profiler_scope_exit(this_fn);
-}
-
-/* Format function name or hex address up to max_len */
+/* Addresses are resolved against the matching ELF by host tools. */
 NO_INST static void format_fn_name(const ProfilerInternalMetric* m, char* out_buf, size_t max_len)
 {
-    if (m->name != NULL) {
-        (void)snprintf(out_buf, max_len, "%.31s", m->name);
-    } else {
-        (void)snprintf(out_buf, max_len, "0x%08lX", (unsigned long)m->fn_address);
-    }
+    (void)snprintf(out_buf, max_len, "0x%08lX", (unsigned long)m->fn_address);
 }
 
 /* Dump telemetry in BIN, CSV, or TOP format */
@@ -646,20 +688,20 @@ NO_INST bool profiler_dump(const struct Stream* stream, ProfilerDumpFormat forma
         uint64_t total_active_cycles = 0ULL;
         uint64_t total_calls = 0ULL;
         size_t active_count = 0U;
-        uint8_t order[PROFILER_CAPACITY_FUNCTIONS];
+        uint16_t order[PROFILER_CAPACITY_FUNCTIONS];
 
         for (size_t i = 0U; i < s_metrics_count; ++i) {
             if (s_metrics[i].call_count > 0U) {
                 total_active_cycles += s_metrics[i].total_cycles;
                 total_calls += s_metrics[i].call_count;
-                order[active_count] = (uint8_t)i;
+                order[active_count] = (uint16_t)i;
                 active_count++;
             }
         }
 
         /* Stable insertion sort of active indices by total_cycles descending */
         for (size_t i = 1U; i < active_count; ++i) {
-            uint8_t key = order[i];
+            uint16_t key = order[i];
             size_t j = i;
             while ((j > 0U) && (s_metrics[order[j - 1U]].total_cycles < s_metrics[key].total_cycles)) {
                 order[j] = order[j - 1U];
@@ -738,7 +780,7 @@ NO_INST bool profiler_dump(const struct Stream* stream, ProfilerDumpFormat forma
 
         int foot_len = snprintf(foot_buf, sizeof(foot_buf),
             "System Utilization: [Active Load: %lu.%1lu%% | Idle / Sleep: %lu.%1lu%%]\r\n"
-            "Scope Summary:      %u active functions | %lu calls | Active: %lu.%1luM cyc | Elapsed: %lu.%02lu s\r\n"
+            "Function Summary:   %u active functions | %lu calls | Active: %lu.%1luM cyc | Elapsed: %lu.%02lu s\r\n"
             "Health:             %u dropped | %u stack overflows | Calibrated probe overhead: %u cyc\r\n",
             (unsigned long)(sys_load_x10 / 10U),
             (unsigned long)(sys_load_x10 % 10U),

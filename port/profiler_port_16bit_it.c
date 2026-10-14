@@ -16,9 +16,10 @@ NO_INST uint32_t profiler_port_ticks(void)
     uint16_t high_after = s_timer_high_word;
 
     if (high_before != high_after) {
-        /* The overflow ISR ran while sampling: re-read the counter */
-        low = profiler_port_hardware_timer16_read_low();
-        high_before = high_after;
+        /* Select the high word belonging to the original low sample. */
+        if (low < 0x8000U) {
+            high_before = high_after;
+        }
     } else if (pending && (low < 0x8000U)) {
         /*
          * The counter wrapped but the overflow ISR has not run yet (interrupts

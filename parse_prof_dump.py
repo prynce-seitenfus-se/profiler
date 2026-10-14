@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import re
 import struct
 import subprocess
 import sys
@@ -179,13 +180,19 @@ def resolve_symbols(
     if elf_path is None:
         return {address: ("0x{:08x}".format(address), "") for address in addresses}
 
+    with elf_path.open("rb") as elf:
+        elf_header = elf.read(20)
+    if len(elf_header) < 20 or elf_header[:4] != b"\x7fELF" or elf_header[5] not in (1, 2):
+        raise ValueError("symbol file is not a valid ELF")
+    byte_order = "little" if elf_header[5] == 1 else "big"
+    is_arm = int.from_bytes(elf_header[18:20], byte_order) == 40
     command = [
         addr2line,
         "-f",
         "-C",
         "-e",
         str(elf_path),
-    ] + ["0x{:08x}".format(address) for address in addresses]
+    ] + ["0x{:08x}".format(address & ~1 if is_arm else address) for address in addresses]
 
     process = subprocess.run(
         command,
@@ -206,6 +213,16 @@ def resolve_symbols(
             function_name = "0x{:08x}".format(address)
         symbols[address] = (function_name, source_location)
     return symbols
+
+
+def resolve_text_log(text: str, elf_path: Path, addr2line: str) -> str:
+    """Resolve the first address field of CSV/TOP rows, preserving other output."""
+    pattern = re.compile(r"^(0x[0-9a-fA-F]{8})(?=,|\s)", re.MULTILINE)
+    addresses = list(dict.fromkeys(int(match.group(1), 16) for match in pattern.finditer(text)))
+    if not addresses:
+        raise ValueError("text log contains no address-based profiler rows")
+    symbols = resolve_symbols(addresses, elf_path, addr2line)
+    return pattern.sub(lambda match: symbols[int(match.group(1), 16)][0], text)
 
 
 def write_metrics_csv(
@@ -295,6 +312,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("dump_file", type=Path, help="PROF-BIN binary dump file")
     parser.add_argument("-e", "--elf", type=Path, help="ELF file used by arm-none-eabi-addr2line")
     parser.add_argument(
+        "--text",
+        action="store_true",
+        help="resolve an address-based CSV/TOP text log (requires --elf)",
+    )
+    parser.add_argument(
         "--addr2line",
         default="arm-none-eabi-addr2line",
         help="addr2line executable (default: arm-none-eabi-addr2line)",
@@ -317,6 +339,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_argument_parser()
     args = parser.parse_args(argv)
     try:
+        if args.text:
+            if args.elf is None:
+                raise ValueError("--text requires --elf")
+            text = resolve_text_log(args.dump_file.read_text(encoding="utf-8"), args.elf, args.addr2line)
+            output_path = args.output or args.dump_file.with_name(args.dump_file.stem + "_resolved.txt")
+            if output_path.resolve() == args.dump_file.resolve():
+                raise ValueError("text output must not overwrite the input log")
+            output_path.write_text(text, encoding="utf-8")
+            return 0
         header, records, _ = read_binary_dump(args.dump_file)
         if header.version >= 3:
             print(
