@@ -98,7 +98,7 @@ target_include_directories(profiler PUBLIC
 )
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(profiler PRIVATE -fno-instrument-functions)
+    target_compile_options(profiler PRIVATE -O2 -fno-instrument-functions)
 endif()
 
 message(STATUS "Profiler transport: ${PROFILER_TRANSPORT}")

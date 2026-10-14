@@ -112,6 +112,9 @@ static uint16_t               s_stale_frames = 0U;
 static uint16_t               s_context_overflows = 0U;
 static uint32_t               s_last_wall_ticks = 0U;
 static uint64_t               s_elapsed_wall_ticks = 0ULL;
+static uint64_t               s_active_root_cycles = 0ULL;
+static uint64_t               s_total_probe_cycles = 0ULL;
+static uint64_t               s_service_cycles = 0ULL;
 
 /* Calibration constants */
 #define PROFILER_CALIBRATION_DEPTH (2U)
@@ -247,6 +250,9 @@ NO_INST static void clear_state(void)
     s_calibration_owner = NULL;
     s_last_wall_ticks = 0U;
     s_elapsed_wall_ticks = 0ULL;
+    s_active_root_cycles = 0ULL;
+    s_total_probe_cycles = 0ULL;
+    s_service_cycles = 0ULL;
 }
 
 NO_INST bool profiler_init(uint32_t frequency, void* transport_device)
@@ -383,6 +389,9 @@ NO_INST void profiler_reset(void)
     s_stale_frames = 0U;
     s_context_overflows = 0U;
     s_elapsed_wall_ticks = 0ULL;
+    s_active_root_cycles = 0ULL;
+    s_total_probe_cycles = 0ULL;
+    s_service_cycles = 0ULL;
     s_last_wall_ticks = profiler_port_ticks();
     (void)memset(s_metrics, 0, sizeof(s_metrics));
     hashmap_clear(&s_map);
@@ -488,7 +497,7 @@ NO_INST static uint32_t frame_cycles(const ProfilerContext* ctx, const ProfilerS
     return cycles;
 }
 
-NO_INST static void record_call(const ProfilerContext* ctx, const void* fn, uint32_t cycles, uint32_t overhead)
+NO_INST static uint32_t record_call(const ProfilerContext* ctx, const void* fn, uint32_t cycles, uint32_t overhead)
 {
     uint32_t net = (overhead < cycles) ? (cycles - overhead) : 0U;
 
@@ -497,6 +506,8 @@ NO_INST static void record_call(const ProfilerContext* ctx, const void* fn, uint
     } else if ((fn == (const void*)&s_calibration_ids[0]) && (net < s_calibration_min)) {
         s_calibration_min = net;
     }
+
+    return net;
 }
 
 NO_INST static void pop_context_frame(ProfilerContext* ctx, const void* fn, uint32_t ts, uint32_t overhead)
@@ -509,7 +520,10 @@ NO_INST static void pop_context_frame(ProfilerContext* ctx, const void* fn, uint
 
     size_t match_idx = match_pos - 1U;
     uint32_t cycles = frame_cycles(ctx, &ctx->frames[match_idx], ts);
-    record_call(ctx, fn, cycles, overhead);
+    uint32_t net = record_call(ctx, fn, cycles, overhead);
+    if ((ctx != &s_calibration_context) && (match_idx == 0U)) {
+        s_active_root_cycles += (uint64_t)net;
+    }
 
     size_t discarded = ctx->index - match_pos;
     if (discarded > 0U) {
@@ -557,7 +571,11 @@ NO_INST __attribute__((noinline)) void __cyg_profile_func_enter(void* this_fn, v
         }
 
         uint32_t ts = profiler_port_ticks();
-        ctx->probe_cycles += ts - start;
+        uint32_t enter_cost = ts - start;
+        ctx->probe_cycles += enter_cost;
+        if (ctx != &s_calibration_context) {
+            s_total_probe_cycles += (uint64_t)enter_cost;
+        }
         if (frame != NULL) {
             frame->enter_probe = ctx->probe_cycles;
             frame->enter_timestamp = ts;
@@ -581,7 +599,11 @@ NO_INST __attribute__((noinline)) void __cyg_profile_func_exit(void* this_fn, vo
 
     if ((ctx != NULL) && (ctx->overflow_depth > 0U)) {
         ctx->overflow_depth--;
-        ctx->probe_cycles += (profiler_port_ticks() - ts) + s_nested_overhead;
+        uint32_t exit_cost = (profiler_port_ticks() - ts) + s_nested_overhead;
+        ctx->probe_cycles += exit_cost;
+        if (ctx != &s_calibration_context) {
+            s_total_probe_cycles += (uint64_t)exit_cost;
+        }
         profiler_port_exit_critical(state);
         return;
     }
@@ -591,7 +613,9 @@ NO_INST __attribute__((noinline)) void __cyg_profile_func_exit(void* this_fn, vo
         ctx->probe_cycles += (profiler_port_ticks() - ts) + s_calibration_nested;
     } else if (ctx != NULL) {
         pop_context_frame(ctx, id, ts, s_probe_overhead);
-        ctx->probe_cycles += (profiler_port_ticks() - ts) + s_nested_overhead;
+        uint32_t exit_cost = (profiler_port_ticks() - ts) + s_nested_overhead;
+        ctx->probe_cycles += exit_cost;
+        s_total_probe_cycles += (uint64_t)exit_cost;
     }
 
     profiler_port_exit_critical(state);
@@ -766,24 +790,33 @@ NO_INST bool profiler_dump(const struct Stream* stream, ProfilerDumpFormat forma
             "-------------------------------------------------------------------------------------------\r\n";
         (void)stream_write(stream, (const uint8_t*)div_line, sizeof(div_line) - 1U);
 
-        char foot_buf[256];
+        char foot_buf[320];
+        uint64_t active_cycles = (s_active_root_cycles > 0ULL) ? s_active_root_cycles : total_active_cycles;
+        uint64_t prof_overhead_cycles = s_total_probe_cycles + s_service_cycles;
         uint32_t sys_load_x10 = (s_elapsed_wall_ticks > 0ULL) ?
-            (uint32_t)((total_active_cycles * 1000ULL) / s_elapsed_wall_ticks) : 0U;
+            (uint32_t)((active_cycles * 1000ULL) / s_elapsed_wall_ticks) : 0U;
         if (sys_load_x10 > 1000U) {
             sys_load_x10 = 1000U;
         }
-        uint32_t idle_x10 = 1000U - sys_load_x10;
+        uint32_t prof_load_x10 = (s_elapsed_wall_ticks > 0ULL) ?
+            (uint32_t)((prof_overhead_cycles * 1000ULL) / s_elapsed_wall_ticks) : 0U;
+        if ((sys_load_x10 + prof_load_x10) > 1000U) {
+            prof_load_x10 = 1000U - sys_load_x10;
+        }
+        uint32_t idle_x10 = 1000U - sys_load_x10 - prof_load_x10;
 
         uint32_t elapsed_sec_x100 = (s_frequency > 0U) ?
             (uint32_t)((s_elapsed_wall_ticks * 100ULL) / (uint64_t)s_frequency) : 0U;
-        uint32_t total_mcyc_x10 = (uint32_t)(total_active_cycles / 100000ULL);
+        uint32_t total_mcyc_x10 = (uint32_t)(active_cycles / 100000ULL);
 
         int foot_len = snprintf(foot_buf, sizeof(foot_buf),
-            "System Utilization: [Active Load: %lu.%1lu%% | Idle / Sleep: %lu.%1lu%%]\r\n"
+            "System Utilization: [Active Load: %lu.%1lu%% | Profiler Overhead: %lu.%1lu%% | Idle / Sleep: %lu.%1lu%%]\r\n"
             "Function Summary:   %u active functions | %lu calls | Active: %lu.%1luM cyc | Elapsed: %lu.%02lu s\r\n"
             "Health:             %u dropped | %u stack overflows | Calibrated probe overhead: %u cyc\r\n",
             (unsigned long)(sys_load_x10 / 10U),
             (unsigned long)(sys_load_x10 % 10U),
+            (unsigned long)(prof_load_x10 / 10U),
+            (unsigned long)(prof_load_x10 % 10U),
             (unsigned long)(idle_x10 / 10U),
             (unsigned long)(idle_x10 % 10U),
             (unsigned int)active_count,
@@ -947,11 +980,27 @@ NO_INST bool profiler_stream_process(const struct Stream* stream)
 NO_INST bool profiler_process(void)
 {
     uint32_t state = profiler_port_enter_critical();
-    if (s_enabled) {
-        uint32_t now = profiler_port_ticks();
-        s_elapsed_wall_ticks += (uint64_t)(now - s_last_wall_ticks);
-        s_last_wall_ticks = now;
+    bool was_enabled = s_enabled;
+    uint32_t start = 0U;
+    if (was_enabled) {
+        start = profiler_port_ticks();
+        s_elapsed_wall_ticks += (uint64_t)(start - s_last_wall_ticks);
+        s_last_wall_ticks = start;
     }
     profiler_port_exit_critical(state);
-    return profiler_transport_process();
+
+    bool handled = profiler_transport_process();
+
+    if (was_enabled && !handled) {
+        state = profiler_port_enter_critical();
+        if (s_enabled) {
+            uint32_t end = profiler_port_ticks();
+            s_elapsed_wall_ticks += (uint64_t)(end - s_last_wall_ticks);
+            s_last_wall_ticks = end;
+            s_service_cycles += (uint64_t)(end - start);
+        }
+        profiler_port_exit_critical(state);
+    }
+
+    return handled;
 }
