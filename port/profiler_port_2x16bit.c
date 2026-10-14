@@ -7,19 +7,15 @@ NO_INST void profiler_port_init(void)
 
 NO_INST uint32_t profiler_port_ticks(void)
 {
-    uint16_t high_before = profiler_port_hardware_timer16_read_high();
-    uint16_t low = profiler_port_hardware_timer16_read_low();
-    uint16_t high_after = profiler_port_hardware_timer16_read_high();
+    uint32_t high_before = (uint32_t)profiler_port_hardware_timer16_read_high();
+    uint32_t low = (uint32_t)profiler_port_hardware_timer16_read_low();
+    uint32_t high_after = (uint32_t)profiler_port_hardware_timer16_read_high();
 
-    /* Keep the original low-counter sample point on both sides of a wrap.
-     * Sampling must finish within half a low-counter period. */
-    if (high_before != high_after) {
-        if (low < 0x8000U) {
-            high_before = high_after;
-        }
-    }
+    /* Branchless wrap selection to eliminate execution-time jitter after sampling low. */
+    uint32_t low_msb_mask = 0U - (low >> 15U);
+    uint32_t high = (high_before & low_msb_mask) | (high_after & ~low_msb_mask);
 
-    return ((uint32_t)high_before << 16U) | (uint32_t)low;
+    return (high << 16U) | low;
 }
 
 NO_INST void profiler_port_16bit_it_overflow_isr(void)
